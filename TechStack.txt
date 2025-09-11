@@ -1,0 +1,89 @@
+Sara AI Bot – TechStack (MVP, Lean Version)
+
+Version: 1.0
+Date: 2025-09-09
+Purpose: Document the minimal yet functional tech stack for running Sara efficiently on a low budget.
+
+1. Core Infrastructure
+
+Backend: Python (FastAPI or Flask)
+
+Hosting / Server: Low-cost VPS (DigitalOcean, Vultr, or Linode $5/month) or Render free tier
+
+2. Telephony Layer
+
+Twilio Voice API
+
+Outbound calls
+
+Call routing & webhooks
+
+Handles call recording & logs
+
+3. Voice AI / Brain
+
+OpenAI GPT-4o-mini
+
+Real-time objection handling
+
+Call flow decisions
+
+Prompt-driven responses based on Sara Knowledge Base
+
+4. Voice Output
+
+ElevenLabs Text-to-Speech API
+
+Converts GPT-generated responses into natural human voice
+
+Adjustable voice, tone, and pacing
+
+5. Memory & Call State
+
+Redis or SQLite
+
+Stores lead progress
+
+Tracks objections encountered
+
+Maintains current call state
+
+6. CRM / Call Logging
+
+Google Sheets or Airtable
+
+Logs each call
+
+Records booked meetings, objections, outcomes
+
+Supports lightweight reporting
+
+7. Orchestration & Flow
+
+Flow: Twilio → Backend → GPT → ElevenLabs → Call Recipient
+
+Handles:
+
+Real-time voice conversion
+
+Call flow branching
+
+Objection routing
+
+Booking logic
+
+8. Monitoring & Error Handling
+
+Twilio Call Logs → call status, duration, recordings
+
+Python Logging → server errors & runtime issues
+
+Optional: Sentry free plan for advanced error tracking
+
+9. Version Control
+
+GitHub (Private Repo)
+
+Stores all scripts, prompts, and flow definitions
+
+Enables iterative updates and rollback if needed

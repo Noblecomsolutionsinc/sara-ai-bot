@@ -1,0 +1,22 @@
+# Ignore environment files
+.env
+*.env
+
+# Ignore API keys or credentials
+*.key
+*.pem
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore logs
+*.log
+
+# Ignore OS junk
+.DS_Store
+Thumbs.db
+
+# Ignore virtual environment (if you make one)
+venv/

@@ -1,0 +1,116 @@
+Sara AI Bot – MVP Plan
+
+Version: v1.0 (2025-09-09)
+
+Purpose
+
+This document defines the Minimum Viable Product (MVP) for the Sara AI Cold Calling Bot. The MVP’s goal is to validate Sara’s ability to bypass gatekeepers, handle objections, spark urgency, and book meetings with decision makers in a live calling environment.
+
+1. Core Objectives
+
+Prove Sara can consistently:
+
+Sound human (tone, pauses, natural fillers).
+
+Get past gatekeepers.
+
+Seed urgency about lost revenue.
+
+Handle top 50 objections (see Sara_Objections.docx).
+
+Offer 2 specific time slots and book meetings.
+
+Deliver measurable ROI by securing first 5 booked meetings with real businesses.
+
+2. MVP Scope
+
+What Sara MUST do (included):
+
+Voice calls via VoIP/Twilio.
+
+Gatekeeper → decision maker flow (Sara_Flow.docx).
+
+10-second openers rotation (Sara_Opening.docx).
+
+Objection handling framework.
+
+Hot lead detection (keywords: start, sign, pricing, ready).
+
+Escalation to human closer (manual transfer or notification).
+
+Call logging (date, business, outcome, objections encountered).
+
+What Sara WILL NOT do yet (excluded):
+
+Full CRM integration (manual logging instead).
+
+Automated rescheduling (handled by human for now).
+
+AI sentiment analysis (future version).
+
+SMS/email follow-ups (future add-on).
+
+3. Success Metrics
+
+Target: Book 5–10 qualified meetings in first 2 weeks.
+
+Benchmarks:
+
+Call to connect rate ≥ 20%.
+
+Gatekeeper pass-through ≥ 30%.
+
+Objection handling success ≥ 50%.
+
+Meeting booking conversion ≥ 10%.
+
+4. Tech Stack (Initial MVP)
+
+Telephony: Twilio / Zoom Phone.
+
+Voice: Natural TTS (ElevenLabs / OpenAI TTS).
+
+NLP Engine: GPT-5 + fine-tuned prompt flows.
+
+Knowledge Base: Sara_Knowledgebase.docx (central source).
+
+Objections & Scripts: Sara_Objections.docx, Sara_Opening.docx, Sara_Flow.docx.
+
+Logging: Google Sheets or Notion (manual logging by human assistant).
+
+5. MVP Testing Plan
+
+Dry Runs
+
+Internal test calls with team.
+
+Validate Sara’s flow, pauses, objection handling.
+
+Controlled Pilot
+
+Call 20 businesses in one niche (e.g., law firms).
+
+Track objections, conversions, and booked meetings.
+
+Iteration
+
+Update scripts based on pilot feedback.
+
+Improve objection responses and opener rotations.
+
+Live Deployment
+
+Expand to 100+ businesses.
+
+Target 5–10 booked meetings.
+
+6. Escalation Rules
+
+Hot Lead Detected (start, sign, contract, pricing, ready):
+→ Immediate notification to founder via SMS/email.
+
+Objection Standoff:
+→ End call politely, schedule callback.
+
+Booked Meeting:
+→ Celebrate, confirm details, log outcome.

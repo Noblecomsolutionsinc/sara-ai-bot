@@ -1,0 +1,6 @@
+openai==1.43.0
+flask==3.0.3
+twilio==9.3.0
+python-dotenv==1.0.1
+elevenlabs==0.2.27
+gunicorn==22.0.0
