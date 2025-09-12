@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------
-# Environment Variables (from your .env)
+# Environment Variables
 # ---------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -19,8 +19,8 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 SERVER_URL = os.getenv("SERVER_URL")
 SARA_NAME = os.getenv("SARA_NAME", "Sara")
 SARA_ROLE = os.getenv("SARA_ROLE", "Digital Marketing Consultant")
-SARA_COMPANY = os.getenv("COMPANY_NAME")       # matches your .env
-CALENDLY_LINK = os.getenv("MEETING_LINK")      # matches your .env
+SARA_COMPANY = os.getenv("COMPANY_NAME")
+CALENDLY_LINK = os.getenv("MEETING_LINK")
 
 # ---------------------------
 # OpenAI Initialization
@@ -69,6 +69,11 @@ def generate_voice(text):
 # ---------------------------
 # Routes
 # ---------------------------
+@app.route("/", methods=["GET"])
+def health_check():
+    """Root route for Render health check"""
+    return "Sara AI Server is running ✅", 200
+
 @app.route("/call_audio/<filename>")
 def serve_audio(filename):
     return send_from_directory(AUDIO_DIR, filename)
