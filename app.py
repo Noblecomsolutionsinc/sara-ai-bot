@@ -1,162 +1,130 @@
 import os
-import tempfile
+import uuid
+from flask import Flask, request, send_from_directory, jsonify
+import openai
 import requests
-from flask import Flask, request, Response, send_file
-from twilio.twiml.voice_response import VoiceResponse, Gather
-from openai import OpenAI
 from dotenv import load_dotenv
 
-# -----------------------------
-# Load environment variables
-# -----------------------------
 load_dotenv()
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
-VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
-TWILIO_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
-if not all([OPENAI_KEY, ELEVENLABS_KEY, VOICE_ID, TWILIO_NUMBER]):
-    raise Exception("Missing required environment variables!")
+# ---------------------------
+# Environment Variables (from your .env)
+# ---------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+SERVER_URL = os.getenv("SERVER_URL")
+SARA_NAME = os.getenv("SARA_NAME", "Sara")
+SARA_ROLE = os.getenv("SARA_ROLE", "Digital Marketing Consultant")
+SARA_COMPANY = os.getenv("COMPANY_NAME")       # matches your .env
+CALENDLY_LINK = os.getenv("MEETING_LINK")      # matches your .env
 
-# Initialize OpenAI client
-client = OpenAI()  # Reads API key from environment
+# ---------------------------
+# OpenAI Initialization
+# ---------------------------
+openai.api_key = OPENAI_API_KEY
 
-# -----------------------------
-# Load Sara Brain text files
-# -----------------------------
-TXT_FILES = [
-    "Sara_SystemPrompt.txt",
-    "Sara_Flow.txt",
-    "Sara_Opening.txt",
-    "Sara_Objections_Playbook_Full.txt",
-    "Sara_Knowledgebase.txt",
-    "Sara_MasterPrompt.txt"
-]
-
-SARA_BRAIN = {}
-for f in TXT_FILES:
-    path = os.path.join(os.getcwd(), f)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"{f} not found!")
-    with open(path, "r", encoding="utf-8") as file:
-        SARA_BRAIN[f] = file.read()
-
-# -----------------------------
-# Flask app
-# -----------------------------
+# ---------------------------
+# Flask App Setup
+# ---------------------------
 app = Flask(__name__)
+AUDIO_DIR = os.path.join("static", "audio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# Audio storage
-STATIC_AUDIO_DIR = os.path.join("static", "audio")
-os.makedirs(STATIC_AUDIO_DIR, exist_ok=True)
-
-# -----------------------------
-# GPT Brain Response
-# -----------------------------
-def sara_gpt_response(prospect_input, conversation_history=[]):
-    system_prompt = SARA_BRAIN["Sara_SystemPrompt.txt"] + "\n" + SARA_BRAIN["Sara_MasterPrompt.txt"]
-    messages = [{"role": "system", "content": system_prompt}]
-    for c in conversation_history:
-        messages.append(c)
-    messages.append({"role": "user", "content": prospect_input})
-
-    resp = client.chat.completions.create(
+# ---------------------------
+# Helper Functions
+# ---------------------------
+def generate_gpt_response(prompt, temperature=0.7):
+    """Generate GPT-5-mini response from prompt"""
+    response = openai.chat.completions.create(
         model="gpt-5-mini",
-        messages=messages
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature
     )
-    return resp.choices[0].message.content
+    return response.choices[0].message["content"]
 
-# -----------------------------
-# ElevenLabs TTS
-# -----------------------------
-def generate_voice_mp3(text, call_sid):
-    """Generate MP3 using ElevenLabs, save to static/audio"""
-    mp3_filename = f"sara_{call_sid}.mp3"
-    mp3_path = os.path.join(STATIC_AUDIO_DIR, mp3_filename)
+def generate_voice(text):
+    """Generate MP3 via ElevenLabs"""
+    filename = f"{uuid.uuid4().hex}.mp3"
+    filepath = os.path.join(AUDIO_DIR, filename)
+    
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json"
+    }
+    data = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
+    response = requests.post(url, json=data, headers=headers)
+    
+    if response.status_code == 200:
+        with open(filepath, "wb") as f:
+            f.write(response.content)
+        return filename
+    else:
+        raise Exception(f"ElevenLabs TTS failed: {response.text}")
 
-    # Skip regeneration if already exists
-    if os.path.exists(mp3_path):
-        return mp3_path
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream"
-    headers = {"xi-api-key": ELEVENLABS_KEY, "Content-Type": "application/json"}
-    payload = {"text": text, "voice_settings": {"stability":0.75, "similarity_boost":0.8}}
-    r = requests.post(url, headers=headers, json=payload, stream=True)
-    with open(mp3_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024):
-            f.write(chunk)
-
-    return mp3_path
-
-# -----------------------------
-# Outbound Call
-# -----------------------------
-@app.route("/outbound", methods=["POST"])
-def outbound():
-    to_number = request.form.get("To") or request.form.get("phone")
-    if not to_number:
-        return "No number provided", 400
-
-    resp = VoiceResponse()
-    gather = Gather(input="speech", timeout=5, action="/conversation", method="POST")
-    gather.say("Hi! This is Sara calling you. Please respond after the beep.")
-    resp.append(gather)
-    return Response(str(resp), mimetype="application/xml")
-
-# -----------------------------
-# Conversation Loop
-# -----------------------------
-@app.route("/conversation", methods=["POST"])
-def conversation():
-    prospect_input = request.form.get("SpeechResult", "")
-    call_sid = request.form.get("CallSid")
-    if not call_sid:
-        return "CallSid missing", 400
-
-    if not hasattr(app, "call_histories"):
-        app.call_histories = {}
-    history = app.call_histories.get(call_sid, [])
-
-    sara_text = sara_gpt_response(prospect_input, history)
-    history.append({"role":"user","content":prospect_input})
-    history.append({"role":"assistant","content":sara_text})
-    app.call_histories[call_sid] = history
-
-    audio_file = generate_voice_mp3(sara_text, call_sid)
-    audio_url = f"/call_audio/{os.path.basename(audio_file)}"
-
-    resp = VoiceResponse()
-    gather = Gather(input="speech", timeout=5, action="/conversation", method="POST")
-    gather.play(audio_url)
-    resp.append(gather)
-
-    return Response(str(resp), mimetype="application/xml")
-
-# -----------------------------
-# Serve audio
-# -----------------------------
+# ---------------------------
+# Routes
+# ---------------------------
 @app.route("/call_audio/<filename>")
 def serve_audio(filename):
-    path = os.path.join(STATIC_AUDIO_DIR, filename)
-    if not os.path.exists(path):
-        return "Audio not found", 404
-    return send_file(path, mimetype="audio/mpeg")
+    return send_from_directory(AUDIO_DIR, filename)
 
-# -----------------------------
-# Cleanup old MP3s
-# -----------------------------
-def cleanup_audio_folder(max_files=50):
-    files = sorted(
-        [os.path.join(STATIC_AUDIO_DIR, f) for f in os.listdir(STATIC_AUDIO_DIR)],
-        key=os.path.getmtime
-    )
-    while len(files) > max_files:
-        os.remove(files[0])
-        files.pop(0)
+@app.route("/outbound", methods=["POST"])
+def outbound_call():
+    """
+    Trigger a new call:
+    Expects JSON: {"name": "John Doe", "phone": "+123456789"}
+    """
+    data = request.get_json()
+    name = data.get("name")
+    phone = data.get("phone")
+    
+    if not name or not phone:
+        return jsonify({"error": "Missing name or phone"}), 400
 
-# -----------------------------
-# Main
-# -----------------------------
+    # Build opening prompt
+    prompt = f"""
+    You are {SARA_NAME}, a {SARA_ROLE} from {SARA_COMPANY}.
+    Call {name} and introduce yourself professionally.
+    Your goal is to create urgency, explain lost revenue opportunity, 
+    handle objections smoothly, and book a meeting at {CALENDLY_LINK}.
+    """
+    
+    gpt_response = generate_gpt_response(prompt)
+    audio_file = generate_voice(gpt_response)
+
+    return jsonify({
+        "status": "success",
+        "audio_url": f"{SERVER_URL}/call_audio/{audio_file}",
+        "message_text": gpt_response
+    })
+
+@app.route("/conversation", methods=["POST"])
+def conversation():
+    """
+    Continue conversation: Expects JSON {"messages": [{"role":"user","content":"..."}]}
+    Returns GPT + TTS
+    """
+    data = request.get_json()
+    messages = data.get("messages", [])
+    if not messages:
+        return jsonify({"error": "Missing messages"}), 400
+
+    response_text = generate_gpt_response(messages[-1]["content"])
+    audio_file = generate_voice(response_text)
+    
+    return jsonify({
+        "status": "success",
+        "audio_url": f"{SERVER_URL}/call_audio/{audio_file}",
+        "message_text": response_text
+    })
+
+# ---------------------------
+# Run Flask App
+# ---------------------------
 if __name__ == "__main__":
-    cleanup_audio_folder()
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
