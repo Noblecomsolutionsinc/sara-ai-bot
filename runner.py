@@ -1,121 +1,64 @@
-import os
 import csv
-import re
-import sys
+import os
 import requests
-from dotenv import load_dotenv
 
-# -----------------------------
 # Load environment
-# -----------------------------
+from dotenv import load_dotenv
 load_dotenv()
-SERVER_URL = os.environ.get("SERVER_URL")
 
+SERVER_URL = os.getenv("SERVER_URL")
 if not SERVER_URL:
-    print("ERROR: SERVER_URL not set in .env")
-    sys.exit(1)
+    raise Exception("SERVER_URL missing in .env")
 
-CSV_IN = "contacts.csv"
-CSV_OUT = "contacts_called.csv"
-
-# -----------------------------
-# Phone sanitizer
-# -----------------------------
-def sanitize_phone(raw):
-    if raw is None:
-        return ""
-    s = str(raw).strip()
-    s = s.strip("`'\" \u200b")
-    s = re.sub(r"[^\d+]", "", s)
-    if s.count("+") > 1:
-        s = s.replace("+", "")
-    digits = re.sub(r"[^\d]", "", s)
-    if s.startswith("+") and digits:
-        return f"+{digits}"
-    if len(digits) == 10:
-        return f"+1{digits}"
-    if len(digits) >= 11:
-        return f"+{digits}"
-    return ""
+CONTACTS_FILE = "contacts.csv"
+CALLED_FILE = "contacts_called.csv"
 
 # -----------------------------
-# Read contacts
+# Helper to call Sara API
 # -----------------------------
-if not os.path.exists(CSV_IN):
-    print(f"{CSV_IN} not found in {os.getcwd()}")
-    sys.exit(1)
-
-contacts = []
-with open(CSV_IN, newline='', encoding='utf-8') as f:
-    reader = csv.DictReader(f)
-    headers = reader.fieldnames or ["name", "phone", "type"]
-    for row in reader:
-        norm_row = {k: ("" if row.get(k) is None else str(row.get(k))) for k in headers}
-        contacts.append(norm_row)
-
-if not contacts:
-    print("No contacts found in CSV.")
-    sys.exit(0)
-
-# -----------------------------
-# Prepare output CSV
-# -----------------------------
-called_file_exists = os.path.exists(CSV_OUT)
-outf = open(CSV_OUT, 'a', newline='', encoding='utf-8')
-writer = csv.DictWriter(outf, fieldnames=headers)
-if not called_file_exists:
-    writer.writeheader()
-
-# -----------------------------
-# Trigger outbound calls
-# -----------------------------
-total = len(contacts)
-success = 0
-fail = 0
-
-for idx, row in enumerate(contacts, start=1):
-    name = row.get('name', '').strip()
-    raw_phone = row.get('phone', '')
-    business_type = row.get('type', '').strip()
-    phone_clean = sanitize_phone(raw_phone)
-
-    print(f"\n[{idx}/{total}] Attempting: {name} | raw: '{raw_phone}' | sanitized: '{phone_clean}'")
-
-    if not phone_clean:
-        print("  -> Skipping: invalid phone.")
-        fail += 1
-        continue
-
-    # Make POST request to /outbound
+def call_sara(phone_number):
+    url = f"{SERVER_URL}/outbound"
+    data = {"phone": phone_number}
     try:
-        r = requests.post(
-            f"{SERVER_URL.rstrip('/')}/outbound",
-            data={"phone": phone_clean},
-            timeout=60
-        )
-        print("  HTTP status:", r.status_code)
-        text = (r.text or "")[:500].replace('\n', ' ')
-        print("  Server response (truncated):", text)
-
-        if r.status_code == 200:
-            writer.writerow(row)
-            outf.flush()
-            success += 1
-            print("  -> Recorded in", CSV_OUT)
-        else:
-            fail += 1
-            print("  -> Not recorded (non-200).")
-
-    except requests.RequestException as e:
-        fail += 1
-        print("  -> Request exception:", str(e))
+        r = requests.post(url, data=data, timeout=10)
+        r.raise_for_status()
+        print(f"Called {phone_number} - Status: {r.status_code}")
+        return True
+    except Exception as e:
+        print(f"Failed to call {phone_number}: {e}")
+        return False
 
 # -----------------------------
-# Summary
+# Main loop
 # -----------------------------
-outf.close()
-print("\n=== SUMMARY ===")
-print("Total contacts in CSV:", total)
-print("Successfully recorded (200):", success)
-print("Failed/skipped:", fail)
-print(f"Called contacts appended to: {CSV_OUT}")
+def main():
+    # Read contacts
+    if not os.path.exists(CONTACTS_FILE):
+        print(f"{CONTACTS_FILE} not found!")
+        return
+
+    with open(CONTACTS_FILE, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        contacts = [row for row in reader]
+
+    called_contacts = []
+    for contact in contacts:
+        phone = contact.get("phone") or contact.get("Phone") or contact.get("PhoneNumber")
+        if not phone:
+            print("No phone number found in row, skipping...")
+            continue
+        success = call_sara(phone)
+        if success:
+            called_contacts.append(contact)
+
+    # Save called contacts
+    if called_contacts:
+        fieldnames = called_contacts[0].keys()
+        with open(CALLED_FILE, "w", newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(called_contacts)
+        print(f"Successfully called {len(called_contacts)} contacts. Saved to {CALLED_FILE}")
+
+if __name__ == "__main__":
+    main()

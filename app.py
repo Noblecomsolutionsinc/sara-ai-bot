@@ -1,7 +1,6 @@
 import os
 import tempfile
 import requests
-import shutil
 from flask import Flask, request, Response, send_file
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from openai import OpenAI
@@ -15,11 +14,14 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 TWILIO_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+SERVER_URL = os.getenv("SERVER_URL")
 
-if not all([OPENAI_KEY, ELEVENLABS_KEY, VOICE_ID, TWILIO_NUMBER]):
-    raise Exception("Missing required environment variables!")
+required_vars = ["OPENAI_KEY","ELEVENLABS_KEY","VOICE_ID","TWILIO_NUMBER","SERVER_URL"]
+missing = [v for v in required_vars if not globals().get(v)]
+if missing:
+    raise Exception(f"Missing required environment variables: {missing}")
 
-# Initialize OpenAI client
+# OpenAI client
 client = OpenAI(api_key=OPENAI_KEY)
 
 # -----------------------------
@@ -71,11 +73,9 @@ def sara_gpt_response(prospect_input, conversation_history=[]):
 # ElevenLabs TTS
 # -----------------------------
 def generate_voice_mp3(text, call_sid):
-    """Generate MP3 using ElevenLabs, save to static/audio"""
     mp3_filename = f"sara_{call_sid}.mp3"
     mp3_path = os.path.join(STATIC_AUDIO_DIR, mp3_filename)
 
-    # Skip regeneration if already exists
     if os.path.exists(mp3_path):
         return mp3_path
 
@@ -86,7 +86,6 @@ def generate_voice_mp3(text, call_sid):
     with open(mp3_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024):
             f.write(chunk)
-
     return mp3_path
 
 # -----------------------------
@@ -94,14 +93,12 @@ def generate_voice_mp3(text, call_sid):
 # -----------------------------
 @app.route("/outbound", methods=["POST"])
 def outbound():
-    # Expect phone number in request
     to_number = request.form.get("To") or request.form.get("phone")
     if not to_number:
         return "No number provided", 400
 
-    # Start TwiML
     resp = VoiceResponse()
-    gather = Gather(input="speech", timeout=5, action="/conversation", method="POST")
+    gather = Gather(input="speech", timeout=5, action=f"{SERVER_URL}/conversation", method="POST")
     gather.say("Hi! This is Sara calling you. Please respond after the beep.")
     resp.append(gather)
     return Response(str(resp), mimetype="application/xml")
@@ -116,24 +113,20 @@ def conversation():
     if not call_sid:
         return "CallSid missing", 400
 
-    # Initialize conversation memory
     if not hasattr(app, "call_histories"):
         app.call_histories = {}
     history = app.call_histories.get(call_sid, [])
 
-    # GPT response
     sara_text = sara_gpt_response(prospect_input, history)
     history.append({"role":"user","content":prospect_input})
     history.append({"role":"assistant","content":sara_text})
     app.call_histories[call_sid] = history
 
-    # Generate audio
     audio_file = generate_voice_mp3(sara_text, call_sid)
-    audio_url = f"/call_audio/{os.path.basename(audio_file)}"
+    audio_url = f"{SERVER_URL}/call_audio/{os.path.basename(audio_file)}"
 
-    # TwiML with Gather for next speech
     resp = VoiceResponse()
-    gather = Gather(input="speech", timeout=5, action="/conversation", method="POST")
+    gather = Gather(input="speech", timeout=5, action=f"{SERVER_URL}/conversation", method="POST")
     gather.play(audio_url)
     resp.append(gather)
 
@@ -165,6 +158,5 @@ def cleanup_audio_folder(max_files=50):
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    # Optional: cleanup old files at startup
     cleanup_audio_folder()
     app.run(debug=True)
