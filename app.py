@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 import requests
 from openai import OpenAI  # explicit client usage
 
-# Load .env
 load_dotenv()
 
 # ---------------------------
@@ -33,15 +32,15 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 # ---------------------------
 # Helper Functions
 # ---------------------------
-def generate_gpt_response(prompt, temperature=0.7):
-    """Generate GPT-5-mini response using explicit OpenAI client"""
+def generate_gpt_response(prompt):
+    """Generate GPT-5-mini response using explicit OpenAI client (no proxies)"""
     client = OpenAI(api_key=OPENAI_API_KEY)
     response = client.chat.completions.create(
         model="gpt-5-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature
+        messages=[{"role": "user", "content": prompt}]
+        # no temperature param, defaults to 1
     )
-    return response.choices[0].message.content  # updated attribute syntax
+    return response.choices[0].message.content
 
 def generate_voice(text):
     """Generate MP3 via ElevenLabs"""
