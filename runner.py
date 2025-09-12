@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SERVER_URL = os.getenv("SERVER_URL")
+SERVER_URL = os.getenv("SERVER_URL")  # e.g., https://sara-ai-bot.onrender.com
 CONTACTS_FILE = "contacts.csv"
 LOG_FILE = "contacts_called.csv"
 DELAY_BETWEEN_CALLS = 5  # seconds
@@ -28,7 +28,7 @@ with open(CONTACTS_FILE, newline="", encoding="utf-8") as f:
     contacts = [row for row in reader]
 
 # ---------------------------
-# Call each contact
+# Call each contact via Render server
 # ---------------------------
 for contact in contacts:
     name = contact.get("name")
@@ -45,57 +45,3 @@ for contact in contacts:
         if response.status_code == 200:
             data = response.json()
             log_writer.writerow({
-                "name": name,
-                "phone": phone,
-                "audio_url": data.get("audio_url"),
-                "message_text": data.get("message_text"),
-                "status": "success"
-            })
-            print(f"[✅] Call triggered for {name} ({phone})")
-        else:
-            try:
-                data = response.json()
-                error_msg = data.get("error", response.text)
-            except Exception:
-                error_msg = response.text
-            log_writer.writerow({
-                "name": name,
-                "phone": phone,
-                "audio_url": "",
-                "message_text": "",
-                "status": f"failed: {error_msg}"
-            })
-            print(f"[❌] Failed for {name} ({phone}): {error_msg}")
-    except requests.exceptions.Timeout:
-        log_writer.writerow({
-            "name": name,
-            "phone": phone,
-            "audio_url": "",
-            "message_text": "",
-            "status": "error: timeout"
-        })
-        print(f"[❌] Timeout error for {name} ({phone})")
-    except requests.exceptions.RequestException as e:
-        log_writer.writerow({
-            "name": name,
-            "phone": phone,
-            "audio_url": "",
-            "message_text": "",
-            "status": f"error: {str(e)}"
-        })
-        print(f"[❌] Request exception for {name} ({phone}): {e}")
-    except Exception as e:
-        log_writer.writerow({
-            "name": name,
-            "phone": phone,
-            "audio_url": "",
-            "message_text": "",
-            "status": f"error: {str(e)}"
-        })
-        print(f"[❌] Unexpected error for {name} ({phone}): {e}")
-
-    log_f.flush()
-    time.sleep(DELAY_BETWEEN_CALLS)
-
-log_f.close()
-print("✅ Runner finished all contacts.")
