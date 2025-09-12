@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import requests
 from openai import OpenAI  # explicit client usage
 
+# Load .env
 load_dotenv()
 
 # ---------------------------
@@ -33,17 +34,14 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 # Helper Functions
 # ---------------------------
 def generate_gpt_response(prompt, temperature=0.7):
-    """Generate GPT-5-mini response using explicit OpenAI client (no proxies)"""
+    """Generate GPT-5-mini response using explicit OpenAI client"""
     client = OpenAI(api_key=OPENAI_API_KEY)
-    try:
-        response = client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature
-        )
-        return response.choices[0].message["content"]
-    except Exception as e:
-        raise Exception(f"GPT generation failed: {str(e)}")
+    response = client.chat.completions.create(
+        model="gpt-5-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature
+    )
+    return response.choices[0].message.content  # updated attribute syntax
 
 def generate_voice(text):
     """Generate MP3 via ElevenLabs"""
@@ -95,7 +93,7 @@ def outbound_call():
     try:
         gpt_response = generate_gpt_response(prompt)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"GPT generation failed: {str(e)}"}), 500
 
     try:
         audio_file = generate_voice(gpt_response)
