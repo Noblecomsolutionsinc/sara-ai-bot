@@ -14,15 +14,12 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 TWILIO_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-SERVER_URL = os.getenv("SERVER_URL")
 
-required_vars = ["OPENAI_KEY","ELEVENLABS_KEY","VOICE_ID","TWILIO_NUMBER","SERVER_URL"]
-missing = [v for v in required_vars if not globals().get(v)]
-if missing:
-    raise Exception(f"Missing required environment variables: {missing}")
+if not all([OPENAI_KEY, ELEVENLABS_KEY, VOICE_ID, TWILIO_NUMBER]):
+    raise Exception("Missing required environment variables!")
 
-# OpenAI client
-client = OpenAI(api_key=OPENAI_KEY)
+# Initialize OpenAI client
+client = OpenAI()  # Reads API key from environment
 
 # -----------------------------
 # Load Sara Brain text files
@@ -73,9 +70,11 @@ def sara_gpt_response(prospect_input, conversation_history=[]):
 # ElevenLabs TTS
 # -----------------------------
 def generate_voice_mp3(text, call_sid):
+    """Generate MP3 using ElevenLabs, save to static/audio"""
     mp3_filename = f"sara_{call_sid}.mp3"
     mp3_path = os.path.join(STATIC_AUDIO_DIR, mp3_filename)
 
+    # Skip regeneration if already exists
     if os.path.exists(mp3_path):
         return mp3_path
 
@@ -86,6 +85,7 @@ def generate_voice_mp3(text, call_sid):
     with open(mp3_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024):
             f.write(chunk)
+
     return mp3_path
 
 # -----------------------------
@@ -98,7 +98,7 @@ def outbound():
         return "No number provided", 400
 
     resp = VoiceResponse()
-    gather = Gather(input="speech", timeout=5, action=f"{SERVER_URL}/conversation", method="POST")
+    gather = Gather(input="speech", timeout=5, action="/conversation", method="POST")
     gather.say("Hi! This is Sara calling you. Please respond after the beep.")
     resp.append(gather)
     return Response(str(resp), mimetype="application/xml")
@@ -123,10 +123,10 @@ def conversation():
     app.call_histories[call_sid] = history
 
     audio_file = generate_voice_mp3(sara_text, call_sid)
-    audio_url = f"{SERVER_URL}/call_audio/{os.path.basename(audio_file)}"
+    audio_url = f"/call_audio/{os.path.basename(audio_file)}"
 
     resp = VoiceResponse()
-    gather = Gather(input="speech", timeout=5, action=f"{SERVER_URL}/conversation", method="POST")
+    gather = Gather(input="speech", timeout=5, action="/conversation", method="POST")
     gather.play(audio_url)
     resp.append(gather)
 
