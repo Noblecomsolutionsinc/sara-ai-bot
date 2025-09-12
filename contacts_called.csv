@@ -3,3 +3,11 @@ The Artistic Monarchs,`+12082798189,Dermatology
 The Artistic Monarchs,+12082798189,Dermatology
 The Artistic Monarchs,+12082798189,Dermatology
 The Artistic Monarchs,+12082798189,Dermatology
+Illusion Derma,+12082798189,,,failed: 500
+Higher esteen,+12082798189,,,failed: 500
+The Artistic Monarchs,+12082798189,,,failed: HTTP 500
+Illusion Derma,+12082798189,,,failed: HTTP 500
+Higher esteen,+12082798189,,,failed: HTTP 500
+The Artistic Monarchs,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'
+Illusion Derma,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'
+Higher esteen,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'

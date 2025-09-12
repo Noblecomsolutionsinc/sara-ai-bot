@@ -1,9 +1,9 @@
 import os
 import uuid
 from flask import Flask, request, send_from_directory, jsonify
-import openai
-import requests
 from dotenv import load_dotenv
+import requests
+from openai import OpenAI  # explicit client usage
 
 load_dotenv()
 
@@ -23,11 +23,6 @@ SARA_COMPANY = os.getenv("COMPANY_NAME")
 CALENDLY_LINK = os.getenv("MEETING_LINK")
 
 # ---------------------------
-# OpenAI Initialization
-# ---------------------------
-openai.api_key = OPENAI_API_KEY
-
-# ---------------------------
 # Flask App Setup
 # ---------------------------
 app = Flask(__name__)
@@ -38,8 +33,9 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 # Helper Functions
 # ---------------------------
 def generate_gpt_response(prompt, temperature=0.7):
-    """Generate GPT-5-mini response from prompt"""
-    response = openai.chat.completions.create(
+    """Generate GPT-5-mini response using explicit OpenAI client (no proxies)"""
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
         model="gpt-5-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=temperature
@@ -71,7 +67,6 @@ def generate_voice(text):
 # ---------------------------
 @app.route("/", methods=["GET"])
 def health_check():
-    """Root route for Render health check"""
     return "Sara AI Server is running ✅", 200
 
 @app.route("/call_audio/<filename>")
@@ -80,10 +75,6 @@ def serve_audio(filename):
 
 @app.route("/outbound", methods=["POST"])
 def outbound_call():
-    """
-    Trigger a new call:
-    Expects JSON: {"name": "John Doe", "phone": "+123456789"}
-    """
     data = request.get_json()
     name = data.get("name")
     phone = data.get("phone")
@@ -99,13 +90,11 @@ def outbound_call():
     """
 
     try:
-        # GPT response
         gpt_response = generate_gpt_response(prompt)
     except Exception as e:
         return jsonify({"error": f"GPT generation failed: {str(e)}"}), 500
 
     try:
-        # ElevenLabs TTS
         audio_file = generate_voice(gpt_response)
     except Exception as e:
         return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
@@ -118,10 +107,6 @@ def outbound_call():
 
 @app.route("/conversation", methods=["POST"])
 def conversation():
-    """
-    Continue conversation: Expects JSON {"messages": [{"role":"user","content":"..."}]}
-    Returns GPT + TTS
-    """
     data = request.get_json()
     messages = data.get("messages", [])
     if not messages:

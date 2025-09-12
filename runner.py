@@ -1,55 +1,101 @@
-import csv
 import os
+import csv
+import time
 import requests
 from dotenv import load_dotenv
-from datetime import datetime
 
 load_dotenv()
 
 SERVER_URL = os.getenv("SERVER_URL")
-if not SERVER_URL:
-    raise Exception("SERVER_URL missing in .env")
-
 CONTACTS_FILE = "contacts.csv"
-CALLED_FILE = "contacts_called.csv"
+LOG_FILE = "contacts_called.csv"
+DELAY_BETWEEN_CALLS = 5  # seconds
 
-def call_sara(phone_number):
-    url = f"{SERVER_URL}/outbound"
-    data = {"phone": phone_number}
+# ---------------------------
+# Prepare log file
+# ---------------------------
+log_exists = os.path.exists(LOG_FILE)
+log_f = open(LOG_FILE, "a", newline="", encoding="utf-8")
+log_writer = csv.DictWriter(log_f, fieldnames=["name", "phone", "audio_url", "message_text", "status"])
+if not log_exists:
+    log_writer.writeheader()
+
+# ---------------------------
+# Load contacts
+# ---------------------------
+with open(CONTACTS_FILE, newline="", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    contacts = [row for row in reader]
+
+# ---------------------------
+# Call each contact
+# ---------------------------
+for contact in contacts:
+    name = contact.get("name")
+    phone = contact.get("phone")
+
+    if not name or not phone:
+        print(f"[SKIP] Invalid contact: {contact}")
+        continue
+
+    payload = {"name": name, "phone": phone}
+
     try:
-        r = requests.post(url, data=data, timeout=15)  # increased timeout
-        r.raise_for_status()
-        print(f"{datetime.now()} - Called {phone_number} - Status: {r.status_code}")
-        return True
+        response = requests.post(f"{SERVER_URL}/outbound", json=payload, timeout=60)
+        if response.status_code == 200:
+            data = response.json()
+            log_writer.writerow({
+                "name": name,
+                "phone": phone,
+                "audio_url": data.get("audio_url"),
+                "message_text": data.get("message_text"),
+                "status": "success"
+            })
+            print(f"[✅] Call triggered for {name} ({phone})")
+        else:
+            try:
+                data = response.json()
+                error_msg = data.get("error", response.text)
+            except Exception:
+                error_msg = response.text
+            log_writer.writerow({
+                "name": name,
+                "phone": phone,
+                "audio_url": "",
+                "message_text": "",
+                "status": f"failed: {error_msg}"
+            })
+            print(f"[❌] Failed for {name} ({phone}): {error_msg}")
+    except requests.exceptions.Timeout:
+        log_writer.writerow({
+            "name": name,
+            "phone": phone,
+            "audio_url": "",
+            "message_text": "",
+            "status": "error: timeout"
+        })
+        print(f"[❌] Timeout error for {name} ({phone})")
+    except requests.exceptions.RequestException as e:
+        log_writer.writerow({
+            "name": name,
+            "phone": phone,
+            "audio_url": "",
+            "message_text": "",
+            "status": f"error: {str(e)}"
+        })
+        print(f"[❌] Request exception for {name} ({phone}): {e}")
     except Exception as e:
-        print(f"{datetime.now()} - Failed to call {phone_number}: {e}")
-        return False
+        log_writer.writerow({
+            "name": name,
+            "phone": phone,
+            "audio_url": "",
+            "message_text": "",
+            "status": f"error: {str(e)}"
+        })
+        print(f"[❌] Unexpected error for {name} ({phone}): {e}")
 
-def main():
-    if not os.path.exists(CONTACTS_FILE):
-        print(f"{CONTACTS_FILE} not found!")
-        return
+    log_f.flush()
+    time.sleep(DELAY_BETWEEN_CALLS)
 
-    with open(CONTACTS_FILE, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        contacts = [row for row in reader]
-
-    called_contacts = []
-    for contact in contacts:
-        phone = contact.get("phone") or contact.get("Phone") or contact.get("PhoneNumber")
-        if not phone:
-            print("No phone number in row, skipping...")
-            continue
-        if call_sara(phone):
-            called_contacts.append(contact)
-
-    if called_contacts:
-        fieldnames = called_contacts[0].keys()
-        with open(CALLED_FILE, "w", newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(called_contacts)
-        print(f"Called {len(called_contacts)} contacts. Saved to {CALLED_FILE}")
-
-if __name__ == "__main__":
-    main()
+log_f.close()
+print("✅ Runner finished all contacts.")
