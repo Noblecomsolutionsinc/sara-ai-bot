@@ -91,16 +91,24 @@ def outbound_call():
     if not name or not phone:
         return jsonify({"error": "Missing name or phone"}), 400
 
-    # Build opening prompt
     prompt = f"""
     You are {SARA_NAME}, a {SARA_ROLE} from {SARA_COMPANY}.
     Call {name} and introduce yourself professionally.
     Your goal is to create urgency, explain lost revenue opportunity, 
     handle objections smoothly, and book a meeting at {CALENDLY_LINK}.
     """
-    
-    gpt_response = generate_gpt_response(prompt)
-    audio_file = generate_voice(gpt_response)
+
+    try:
+        # GPT response
+        gpt_response = generate_gpt_response(prompt)
+    except Exception as e:
+        return jsonify({"error": f"GPT generation failed: {str(e)}"}), 500
+
+    try:
+        # ElevenLabs TTS
+        audio_file = generate_voice(gpt_response)
+    except Exception as e:
+        return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
 
     return jsonify({
         "status": "success",
@@ -119,9 +127,16 @@ def conversation():
     if not messages:
         return jsonify({"error": "Missing messages"}), 400
 
-    response_text = generate_gpt_response(messages[-1]["content"])
-    audio_file = generate_voice(response_text)
-    
+    try:
+        response_text = generate_gpt_response(messages[-1]["content"])
+    except Exception as e:
+        return jsonify({"error": f"GPT generation failed: {str(e)}"}), 500
+
+    try:
+        audio_file = generate_voice(response_text)
+    except Exception as e:
+        return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
+
     return jsonify({
         "status": "success",
         "audio_url": f"{SERVER_URL}/call_audio/{audio_file}",
