@@ -1,40 +1,26 @@
+from flask import Flask, request, jsonify
 import os
-import uuid
-from flask import Flask, request, send_from_directory, jsonify
+import traceback
 from dotenv import load_dotenv
-import requests
-from openai import OpenAI  # explicit client usage
+import openai
+from elevenlabs import generate, set_api_key  # Adjust if using your own TTS wrapper
 
+# Load environment variables
 load_dotenv()
 
-# ---------------------------
-# Environment Variables
-# ---------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-SERVER_URL = os.getenv("SERVER_URL")
-SARA_NAME = os.getenv("SARA_NAME", "Sara")
-SARA_ROLE = os.getenv("SARA_ROLE", "Digital Marketing Consultant")
-SARA_COMPANY = os.getenv("COMPANY_NAME")
-CALENDLY_LINK = os.getenv("MEETING_LINK")
-
-# ---------------------------
-# Flask App Setup
-# ---------------------------
+# Flask app
 app = Flask(__name__)
-AUDIO_DIR = os.path.join("static", "audio")
-os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# ---------------------------
-# Helper Functions
-# ---------------------------
+# OpenAI setup
+openai.api_key = os.getenv("OPENAI_API_KEY")
+client = openai.OpenAI(api_key=openai.api_key)
+
+# ElevenLabs setup
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+set_api_key(ELEVEN_API_KEY)
+
+# Function to generate GPT response
 def generate_gpt_response(prompt):
-    """Generate GPT-5-mini response using explicit OpenAI client"""
-    client = OpenAI(api_key=OPENAI_API_KEY)
     try:
         response = client.chat.completions.create(
             model="gpt-5-mini",
@@ -42,77 +28,63 @@ def generate_gpt_response(prompt):
         )
         return response.choices[0].message.content
     except Exception as e:
-        # Log and re-raise for route to catch
-        print(f"[ERROR] GPT generation failed: {e}")
+        print("[ERROR] GPT call failed")
+        traceback.print_exc()
         raise
 
-def generate_voice(text):
-    """Generate MP3 via ElevenLabs"""
-    filename = f"{uuid.uuid4().hex}.mp3"
-    filepath = os.path.join(AUDIO_DIR, filename)
+# Function to generate TTS audio
+def generate_tts_audio(text, voice="alloy"):
+    try:
+        audio = generate(text=text, voice=voice)
+        # Save locally or return as URL depending on your setup
+        audio_file = f"temp_{voice}.mp3"
+        with open(audio_file, "wb") as f:
+            f.write(audio)
+        return audio_file
+    except Exception as e:
+        print("[ERROR] TTS generation failed")
+        traceback.print_exc()
+        raise
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json"
-    }
-    data = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
-    response = requests.post(url, json=data, headers=headers)
-
-    if response.status_code == 200:
-        with open(filepath, "wb") as f:
-            f.write(response.content)
-        return filename
-    else:
-        print(f"[ERROR] ElevenLabs TTS failed: {response.text}")
-        raise Exception(f"ElevenLabs TTS failed: {response.text}")
-
-# ---------------------------
-# Routes
-# ---------------------------
-@app.route("/", methods=["GET"])
-def health_check():
-    return "Sara AI Server is running ✅", 200
-
-@app.route("/call_audio/<filename>")
-def serve_audio(filename):
-    return send_from_directory(AUDIO_DIR, filename)
-
+# Outbound route
 @app.route("/outbound", methods=["POST"])
 def outbound_call():
-    data = request.get_json()
-    name = data.get("name")
-    phone = data.get("phone")
-
-    if not name or not phone:
-        return jsonify({"error": "Missing name or phone"}), 400
-
-    prompt = f"""
-    You are {SARA_NAME}, a {SARA_ROLE} from {SARA_COMPANY}.
-    Call {name} and introduce yourself professionally.
-    Your goal is to create urgency, explain lost revenue opportunity, 
-    handle objections smoothly, and book a meeting at {CALENDLY_LINK}.
-    """
-
     try:
-        gpt_response = generate_gpt_response(prompt)
+        data = request.get_json()
+        name = data.get("name")
+        phone = data.get("phone")
+        print(f"[DEBUG] Received call request: {name} ({phone})")
+
+        prompt = f"Call script for {name}, phone: {phone}"
+
+        # GPT step
+        try:
+            gpt_response = generate_gpt_response(prompt)
+            print("[DEBUG] GPT response received")
+        except Exception as e:
+            return jsonify({"error": f"GPT generation failed: {str(e)}"}), 500
+
+        # TTS step
+        try:
+            audio_url = generate_tts_audio(gpt_response)
+            print("[DEBUG] TTS audio generated")
+        except Exception as e:
+            return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
+
+        return jsonify({
+            "message_text": gpt_response,
+            "audio_url": audio_url
+        })
+
     except Exception as e:
-        return jsonify({"error": f"GPT generation failed: {str(e)}"}), 500
+        print("[ERROR] Outbound call failed")
+        traceback.print_exc()
+        return jsonify({"error": f"Outbound call failed: {str(e)}"}), 500
 
-    # Keep TTS call for later — optional for debug
-    try:
-        audio_file = generate_voice(gpt_response)
-    except Exception as e:
-        return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
+# Health check
+@app.route("/", methods=["GET"])
+def health_check():
+    return "Sara AI Server is running ✅"
 
-    return jsonify({
-        "status": "success",
-        "audio_url": f"{SERVER_URL}/call_audio/{audio_file}",
-        "message_text": gpt_response
-    })
-
-# ---------------------------
-# Run Flask App
-# ---------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
