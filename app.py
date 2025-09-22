@@ -33,20 +33,24 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 # Helper Functions
 # ---------------------------
 def generate_gpt_response(prompt):
-    """Generate GPT-5-mini response using explicit OpenAI client (no proxies)"""
+    """Generate GPT-5-mini response using explicit OpenAI client"""
     client = OpenAI(api_key=OPENAI_API_KEY)
-    response = client.chat.completions.create(
-        model="gpt-5-mini",
-        messages=[{"role": "user", "content": prompt}]
-        # no temperature param, defaults to 1
-    )
-    return response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        # Log and re-raise for route to catch
+        print(f"[ERROR] GPT generation failed: {e}")
+        raise
 
 def generate_voice(text):
     """Generate MP3 via ElevenLabs"""
     filename = f"{uuid.uuid4().hex}.mp3"
     filepath = os.path.join(AUDIO_DIR, filename)
-    
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
@@ -54,12 +58,13 @@ def generate_voice(text):
     }
     data = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
     response = requests.post(url, json=data, headers=headers)
-    
+
     if response.status_code == 200:
         with open(filepath, "wb") as f:
             f.write(response.content)
         return filename
     else:
+        print(f"[ERROR] ElevenLabs TTS failed: {response.text}")
         raise Exception(f"ElevenLabs TTS failed: {response.text}")
 
 # ---------------------------
@@ -78,7 +83,7 @@ def outbound_call():
     data = request.get_json()
     name = data.get("name")
     phone = data.get("phone")
-    
+
     if not name or not phone:
         return jsonify({"error": "Missing name or phone"}), 400
 
@@ -94,6 +99,7 @@ def outbound_call():
     except Exception as e:
         return jsonify({"error": f"GPT generation failed: {str(e)}"}), 500
 
+    # Keep TTS call for later — optional for debug
     try:
         audio_file = generate_voice(gpt_response)
     except Exception as e:
@@ -103,29 +109,6 @@ def outbound_call():
         "status": "success",
         "audio_url": f"{SERVER_URL}/call_audio/{audio_file}",
         "message_text": gpt_response
-    })
-
-@app.route("/conversation", methods=["POST"])
-def conversation():
-    data = request.get_json()
-    messages = data.get("messages", [])
-    if not messages:
-        return jsonify({"error": "Missing messages"}), 400
-
-    try:
-        response_text = generate_gpt_response(messages[-1]["content"])
-    except Exception as e:
-        return jsonify({"error": f"GPT generation failed: {str(e)}"}), 500
-
-    try:
-        audio_file = generate_voice(response_text)
-    except Exception as e:
-        return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
-
-    return jsonify({
-        "status": "success",
-        "audio_url": f"{SERVER_URL}/call_audio/{audio_file}",
-        "message_text": response_text
     })
 
 # ---------------------------
