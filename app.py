@@ -1,4 +1,4 @@
-# app.py — Robust Sara AI outbound: OpenAI -> ElevenLabs (streamed) -> Twilio
+# app.py — Robust Sara AI outbound: OpenAI (requests w/ timeout) -> ElevenLabs (streamed) -> Twilio
 import os
 import uuid
 import time
@@ -8,7 +8,6 @@ from datetime import datetime
 from flask import Flask, request, send_from_directory, jsonify, Response
 from dotenv import load_dotenv
 import requests
-from openai import OpenAI
 from twilio.rest import Client as TwilioClient
 
 # Load .env
@@ -18,8 +17,11 @@ load_dotenv()
 # Config / env
 # ---------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))  # seconds
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+ELEVENLABS_TTS_TIMEOUT = int(os.getenv("ELEVENLABS_TTS_TIMEOUT", "120"))
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
@@ -30,8 +32,8 @@ SARA_COMPANY = os.getenv("COMPANY_NAME", "")
 CALENDLY_LINK = os.getenv("MEETING_LINK", "")
 
 # Retry/backoff policy
-RETRY_ATTEMPTS = 2
-RETRY_BACKOFF_SECONDS = 1  # exponential backoff base multiplier
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "2"))
+RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "1"))
 
 # ---------------------------
 # App setup
@@ -44,8 +46,7 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sara-ai")
 
-# Initialize API clients (we don't crash if env missing; we'll raise later with clear errors)
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# Initialize Twilio client only if credentials present
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 
 # ---------------------------
@@ -65,25 +66,37 @@ def check_env_vars():
     return missing
 
 # ---------------------------
-# OpenAI (GPT) helper
+# OpenAI (HTTP) helper using requests with timeout & retries
 # ---------------------------
-def generate_gpt_response(prompt: str, retries: int = RETRY_ATTEMPTS, timeout_seconds: int = 60) -> str:
-    """Generate text using OpenAI with retries and timing logs."""
-    if not openai_client:
+def generate_gpt_response(prompt: str, retries: int = RETRY_ATTEMPTS, timeout_seconds: int = OPENAI_TIMEOUT) -> str:
+    """Call OpenAI Chat Completions via requests with enforced timeout and retries."""
+    if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gpt-5-mini",
+        "messages": [{"role": "user", "content": prompt}]
+    }
 
     start = time.time()
     last_exc = None
-    for attempt in range(1, retries + 2):  # retries + initial try
+    for attempt in range(1, retries + 2):
         try:
             logger.info("OpenAI: attempt %d start @ %s", attempt, datetime.utcnow().isoformat())
-            # call the explicit client
-            resp = openai_client.chat.completions.create(
-                model="gpt-5-mini",
-                messages=[{"role": "user", "content": prompt}],
-                # note: some client versions accept a timeout kw; if supported, add it here
-            )
-            text = resp.choices[0].message.content
+            resp = requests.post(OPENAI_API_URL, json=payload, headers=headers, timeout=timeout_seconds)
+            text_resp = resp.text[:2000]
+            if resp.status_code != 200:
+                logger.warning("OpenAI: non-200 status=%s body=%s", resp.status_code, text_resp)
+                raise RuntimeError(f"OpenAI returned status {resp.status_code}: {text_resp}")
+            j = resp.json()
+            # safe path to extract text
+            choice = j.get("choices", [{}])[0]
+            message = choice.get("message") or {}
+            text = message.get("content") or choice.get("text") or ""
             duration = time.time() - start
             logger.info("OpenAI: success attempt=%d duration=%.2fs chars=%d", attempt, duration, len(text or ""))
             return text
@@ -100,13 +113,9 @@ def generate_gpt_response(prompt: str, retries: int = RETRY_ATTEMPTS, timeout_se
                 raise RuntimeError(f"OpenAI generation failed after {attempt} attempts: {str(e)}") from e
 
 # ---------------------------
-# ElevenLabs TTS helper
+# ElevenLabs TTS helper (streaming)
 # ---------------------------
-def generate_voice_file(text: str, voice_id: str = ELEVENLABS_VOICE_ID, retries: int = RETRY_ATTEMPTS, tts_timeout: int = 120) -> str:
-    """
-    Generate MP3 from ElevenLabs TTS HTTP API and stream to file.
-    Returns filename (basename saved under static/audio).
-    """
+def generate_voice_file(text: str, voice_id: str = ELEVENLABS_VOICE_ID, retries: int = RETRY_ATTEMPTS, tts_timeout: int = ELEVENLABS_TTS_TIMEOUT) -> str:
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("ELEVENLABS_API_KEY not configured")
     if not voice_id:
@@ -117,10 +126,7 @@ def generate_voice_file(text: str, voice_id: str = ELEVENLABS_VOICE_ID, retries:
         "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json"
     }
-    payload = {
-        "text": text,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-    }
+    payload = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
 
     start = time.time()
     last_exc = None
@@ -188,12 +194,10 @@ def serve_audio(filename):
     filepath = os.path.join(AUDIO_DIR, filename)
     if not os.path.exists(filepath):
         return jsonify({"error": "audio file not found"}), 404
-    # send static file
     return send_from_directory(AUDIO_DIR, filename, conditional=True)
 
 @app.route("/twiml/<filename>", methods=["GET"])
 def twiml(filename):
-    # TwiML endpoint for Twilio to play MP3
     audio_url = f"{SERVER_URL.rstrip('/')}/call_audio/{filename}"
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -208,7 +212,6 @@ def outbound_call():
 
     data = request.get_json(silent=True) or {}
 
-    # flexible payload shapes
     name = (
         data.get("name")
         or data.get("contact_name")
@@ -240,20 +243,17 @@ def outbound_call():
     )
 
     try:
-        # Step 1: GPT
         gpt_start = time.time()
         gpt_response = generate_gpt_response(prompt)
         gpt_duration = time.time() - gpt_start
         logger.info("OUTBOUND: GPT done duration=%.2fs chars=%d", gpt_duration, len(gpt_response or ""))
 
-        # Step 2: TTS
         tts_start = time.time()
         audio_file = generate_voice_file(gpt_response)
         audio_url = f"{SERVER_URL.rstrip('/')}/call_audio/{audio_file}"
         tts_duration = time.time() - tts_start
         logger.info("OUTBOUND: TTS done duration=%.2fs file=%s", tts_duration, audio_file)
 
-        # Step 3: Twilio call (use TwiML endpoint)
         twiml_url = f"{SERVER_URL.rstrip('/')}/twiml/{audio_file}"
         call_sid = create_twilio_call(phone, twiml_url)
 
@@ -270,12 +270,10 @@ def outbound_call():
     except Exception as e:
         duration = time.time() - request_start
         logger.error("OUTBOUND FAILED duration=%.2fs error=%s", duration, str(e), exc_info=True)
-        # Return clean JSON error; logs include full traceback
         return jsonify({"error": str(e)}), 500
 
 # ---------------------------
 # Run (for local testing)
 # ---------------------------
 if __name__ == "__main__":
-    # Use a high-level host/port for local debug
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
