@@ -11,3 +11,12 @@ Higher esteen,+12082798189,,,failed: HTTP 500
 The Artistic Monarchs,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'
 Illusion Derma,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'
 Higher esteen,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'
+The Artistic Monarchs,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'
+Illusion Derma,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'
+Higher esteen,+12082798189,,,failed: GPT generation failed: Client.__init__() got an unexpected keyword argument 'proxies'
+The Artistic Monarchs,+12082798189,,,"HTTP 500: {""error"":""Client.__init__() got an unexpected keyword argument 'proxies'""}
+"
+Illusion Derma,+12082798189,,,"HTTP 500: {""error"":""Client.__init__() got an unexpected keyword argument 'proxies'""}
+"
+Higher esteen,+12082798189,,,"HTTP 500: {""error"":""Client.__init__() got an unexpected keyword argument 'proxies'""}
+"
