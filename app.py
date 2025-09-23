@@ -188,7 +188,7 @@ def health_check():
 def serve_audio(filename):
     return send_from_directory(AUDIO_DIR, filename, conditional=True)
 
-@app.route("/twiml/<filename>", methods=["GET"])
+@app.route("/twiml/<filename>", methods=["GET", "POST"])
 def twiml(filename):
     audio_url = f"{SERVER_URL.rstrip('/')}/call_audio/{filename}"
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -196,6 +196,7 @@ def twiml(filename):
     <Play>{audio_url}</Play>
 </Response>"""
     return Response(xml, mimetype="application/xml")
+
 
 @app.route("/outbound", methods=["POST"])
 def outbound_call():
