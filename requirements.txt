@@ -3,3 +3,10 @@ python-dotenv
 requests>=2.31.0
 twilio>=8.0
 gunicorn>=20.1
+
+# For streaming server
+websockets>=11.0
+pydub>=0.25.1
+soundfile>=0.12.1
+numpy>=1.26.0
+aiohttp>=3.9.0
