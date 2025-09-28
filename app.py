@@ -4,13 +4,13 @@ import os
 import uuid
 import time
 import logging
-import glob
-import json
 from datetime import datetime
 from flask import Flask, request, send_from_directory, jsonify, Response
 from dotenv import load_dotenv
 import requests
 from twilio.rest import Client as TwilioClient
+import glob
+import json
 
 # Load .env
 load_dotenv()
@@ -39,17 +39,16 @@ SARA_ROLE = os.getenv("SARA_ROLE", "Digital Marketing Consultant")
 SARA_COMPANY = os.getenv("COMPANY_NAME", "")
 CALENDLY_LINK = os.getenv("MEETING_LINK", "")
 
-# Retry/backoff policy
+# For streaming
+STREAMING_WS_URL = os.getenv("TWILIO_MEDIA_WS_URL", "wss://sara-ai-streaming.onrender.com")
+
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "2"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "1"))
 
-# Behaviour flags
 SIMULATE = os.getenv("SIMULATE", "false").strip().lower() in ("1", "true", "yes")
 MP3_RETENTION_HOURS = int(os.getenv("MP3_RETENTION_HOURS", "24"))
 
-# ---------------------------
 # Logging
-# ---------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -71,15 +70,14 @@ if not SIMULATE and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     except Exception:
         logger.exception("Failed to initialize Twilio client")
 
-# Try to load SaraBrain
+# SaraBrain
 brain = None
 try:
     from sara_brain import SaraBrain
     brain = SaraBrain()
     logger.info("SaraBrain loaded successfully.")
 except Exception as e:
-    brain = None
-    logger.warning("SaraBrain not loaded: %s", str(e))
+    logger.warning("SaraBrain not loaded or failed: %s", str(e))
 
 # ---------------------------
 # Helpers
@@ -108,21 +106,21 @@ def cleanup_old_audio(retention_hours: int = MP3_RETENTION_HOURS):
             logger.exception("cleanup_old_audio: failed to remove %s", path)
 
 # ---------------------------
-# OpenAI helper
+# GPT helper
 # ---------------------------
-def generate_gpt_response(messages, retries=RETRY_ATTEMPTS,
-                          timeout_seconds=OPENAI_TIMEOUT,
-                          max_tokens=OPENAI_MAX_TOKENS,
-                          expect_json=True):
+def generate_gpt_response(messages, retries: int = RETRY_ATTEMPTS,
+                          timeout_seconds: int = OPENAI_TIMEOUT,
+                          max_tokens: int = OPENAI_MAX_TOKENS,
+                          expect_json: bool = True):
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
 
     system_json_prompt = """You are Sara, an AI sales consultant.
-Always respond with ONLY a valid JSON object in this schema:
+Always respond with ONLY a valid JSON object:
 
 {
-  "sara_text": "string",
-  "action": "string or null"
+  "sara_text": "string with Sara's spoken reply",
+  "action": "optional string or null"
 }"""
 
     full_messages = [{"role": "system", "content": system_json_prompt}] + messages
@@ -145,10 +143,13 @@ Always respond with ONLY a valid JSON object in this schema:
             raw_text = j.get("choices", [])[0].get("message", {}).get("content", "")
             if not raw_text.strip():
                 return {"sara_text": "[Error: empty reply]", "action": None}
-            return json.loads(raw_text)
+            try:
+                parsed = json.loads(raw_text)
+                return {"sara_text": parsed.get("sara_text", ""), "action": parsed.get("action")}
+            except Exception:
+                return {"sara_text": raw_text, "action": None}
         except Exception as e:
             last_exc = e
-            logger.warning("Error in GPT call: %s", str(e))
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
     raise RuntimeError("OpenAI generation failed") from last_exc
@@ -157,18 +158,18 @@ Always respond with ONLY a valid JSON object in this schema:
 # ElevenLabs TTS helper
 # ---------------------------
 def generate_voice_file(text: str, voice_id: str = ELEVENLABS_VOICE_ID,
-                        retries=RETRY_ATTEMPTS, tts_timeout=ELEVENLABS_TTS_TIMEOUT) -> str:
-    if not ELEVENLABS_API_KEY or not voice_id:
-        raise RuntimeError("ElevenLabs not configured")
+                        retries: int = RETRY_ATTEMPTS,
+                        tts_timeout: int = ELEVENLABS_TTS_TIMEOUT) -> str:
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError("ELEVENLABS_API_KEY not configured")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
     payload = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
-    last_exc = None
     for attempt in range(1, retries + 2):
         try:
             with requests.post(url, json=payload, headers=headers, stream=True, timeout=tts_timeout) as r:
                 if r.status_code != 200:
-                    raise RuntimeError(f"ElevenLabs returned {r.status_code}: {truncate(r.text)}")
+                    raise RuntimeError(f"ElevenLabs error {r.status_code}: {truncate(r.text)}")
                 filename = f"{uuid.uuid4().hex}.mp3"
                 filepath = os.path.join(AUDIO_DIR, filename)
                 with open(filepath, "wb") as fw:
@@ -176,17 +177,15 @@ def generate_voice_file(text: str, voice_id: str = ELEVENLABS_VOICE_ID,
                         if chunk:
                             fw.write(chunk)
                 return filename
-        except Exception as e:
-            last_exc = e
+        except Exception:
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-    raise RuntimeError("TTS generation failed") from last_exc
+    raise RuntimeError("TTS generation failed")
 
 # ---------------------------
 # Twilio helper
 # ---------------------------
 def create_twilio_call(phone: str, twiml_url: str) -> str:
     if SIMULATE:
-        logger.info("SIMULATE: skipping call to %s", redact_phone(phone))
         return "SIMULATED"
     if not twilio_client:
         raise RuntimeError("Twilio client not configured")
@@ -199,7 +198,7 @@ def create_twilio_call(phone: str, twiml_url: str) -> str:
 @app.route("/", methods=["GET"])
 def health_check():
     missing = check_env_vars()
-    return jsonify({"status": "ok" if not missing else "misconfigured", "missing_env": missing}), (200 if not missing else 500)
+    return jsonify({"status": "ok" if not missing else "misconfigured", "missing_env": missing}), 200
 
 @app.route("/call_audio/<filename>", methods=["GET"])
 def serve_audio(filename):
@@ -214,83 +213,51 @@ def twiml(filename):
 </Response>"""
     return Response(xml, mimetype="application/xml")
 
+# 🔹 NEW STREAMING ROUTE
+@app.route("/twiml/stream", methods=["POST", "GET"])
+def twiml_stream():
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Start>
+        <Stream url="{STREAMING_WS_URL}" />
+    </Start>
+    <Say voice="alice">Hi, this is Sara from Noblecom Solutions. One moment while I connect.</Say>
+</Response>"""
+    return Response(xml, mimetype="application/xml")
+
 @app.route("/outbound", methods=["POST"])
 def outbound_call():
     cleanup_old_audio()
     data = request.get_json(silent=True) or {}
-    name = data.get("name") or ""
-    phone = data.get("phone") or ""
+    name = data.get("name", "")
+    phone = data.get("phone", "")
     if not name or not phone:
         return jsonify({"error": "Missing name or phone"}), 400
-
-    prompt = f"You are Sara Hayes, {SARA_ROLE} at {SARA_COMPANY}. Persuade {name} to book a call. Meeting link: {CALENDLY_LINK}."
+    prompt = f"You are {SARA_NAME}, {SARA_ROLE} at {SARA_COMPANY}. Persuade {name} to book a call. Meeting link: {CALENDLY_LINK}."
     try:
         gpt_response = generate_gpt_response([{"role": "user", "content": prompt}], expect_json=True)
         gpt_text = gpt_response.get("sara_text", "")
         audio_file = generate_voice_file(gpt_text)
-        audio_url = f"{SERVER_URL.rstrip('/')}/call_audio/{audio_file}"
         twiml_url = f"{SERVER_URL.rstrip('/')}/twiml/{audio_file}"
         call_sid = create_twilio_call(phone, twiml_url)
-        return jsonify({"status": "queued", "call_sid": call_sid, "audio_url": audio_url, "message_text": gpt_text}), 200
+        return jsonify({"status": "queued", "call_sid": call_sid, "message_text": gpt_text}), 200
     except Exception as e:
-        logger.exception("OUTBOUND FAILED: %s", str(e))
         return jsonify({"error": "internal server error"}), 500
 
 @app.route("/chat", methods=["POST"])
 def chat_with_sara():
     cleanup_old_audio()
     payload = request.get_json(silent=True) or {}
-    conv_id = payload.get("conversation_id", "default")
     user_input = payload.get("user_input", "")
-    metadata = payload.get("metadata", {}) or {}
     do_tts = bool(payload.get("tts", False))
-
     if not brain:
         return jsonify({"error": "SaraBrain not available"}), 500
-
-    try:
-        for k in ("stage", "introduced", "lead_name", "last_agent_line"):
-            if k in metadata:
-                brain.set_metadata(k, metadata[k])
-    except Exception:
-        logger.debug("Metadata update failed")
-
-    try:
-        sara_resp = brain.get_response(user_input)
-    except Exception as e:
-        logger.exception("SaraBrain.get_response failed: %s", str(e))
-        return jsonify({"error": "internal"}), 500
-
+    sara_resp = brain.get_response(user_input)
     audio_file, audio_url = None, None
     if do_tts and sara_resp.get("sara_text"):
-        try:
-            audio_file = generate_voice_file(sara_resp["sara_text"])
-            audio_url = f"{SERVER_URL.rstrip('/')}/call_audio/{audio_file}"
-        except Exception as e:
-            logger.warning("TTS failed: %s", str(e))
-
-    return jsonify({"conversation_id": conv_id, "response": sara_resp, "audio_file": audio_file, "audio_url": audio_url}), 200
-
-# ---------------------------
-# NEW: Media Streams endpoint (Twilio will hit this)
-# ---------------------------
-@app.route("/media", methods=["POST"])
-def media_entrypoint():
-    """
-    Twilio hits this route to start a call with Media Streams enabled.
-    It just tells Twilio: 'connect your audio stream to our websocket server'.
-    """
-    ws_url = os.getenv("TWILIO_MEDIA_WS_URL")
-    if not ws_url:
-        return jsonify({"error": "TWILIO_MEDIA_WS_URL not configured"}), 500
-
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Connect>
-        <Stream url="{ws_url}" />
-    </Connect>
-</Response>"""
-    return Response(xml, mimetype="application/xml")
+        audio_file = generate_voice_file(sara_resp["sara_text"])
+        audio_url = f"{SERVER_URL.rstrip('/')}/call_audio/{audio_file}"
+    return jsonify({"response": sara_resp, "audio_file": audio_file, "audio_url": audio_url}), 200
 
 # ---------------------------
 # Run
