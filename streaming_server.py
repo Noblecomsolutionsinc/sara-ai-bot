@@ -1,4 +1,4 @@
-# File: streaming_server.py - MINIMAL PROTOCOL VERSION
+# File: streaming_server.py - WORKING MINIMAL VERSION
 import os
 import json
 import time
@@ -26,13 +26,15 @@ class TwilioMediaHandler:
         self.connections[ws_id] = {
             'ws': ws,
             'stream_sid': None,
-            'chunk_counter': 0
+            'chunk_counter': 0,
+            'audio_buffer': bytearray(),
+            'last_audio_time': time.time()
         }
         
         log.info("🎉 WebSocket connected: %s", ws_id)
         
         try:
-            # 1. Send connected event (NO streamSid)
+            # 1. Send connected event
             connected_msg = {
                 "event": "connected",
                 "protocol": "Call",
@@ -56,13 +58,11 @@ class TwilioMediaHandler:
                             log.info("⏹️ Stop event received")
                             break
                             
-                    except json.JSONDecodeError:
-                        log.error("❌ Invalid JSON received")
                     except Exception as e:
-                        log.error("❌ Error processing message: %s", e)
+                        log.error("Error processing message: %s", e)
                         
         except Exception as e:
-            log.error("❌ WebSocket error: %s", e)
+            log.error("WebSocket error: %s", e)
         finally:
             log.info("🔚 Closing connection: %s", ws_id)
             self.connections.pop(ws_id, None)
@@ -84,11 +84,10 @@ class TwilioMediaHandler:
         self.connections[ws_id]['call_sid'] = call_sid
         self.connections[ws_id]['sample_rate'] = sample_rate
         
-        log.info("🎬 Stream started - stream_sid: %s, call_sid: %s, sample_rate: %s", 
-                stream_sid, call_sid, sample_rate)
+        log.info("🎬 Stream started - stream_sid: %s", stream_sid)
         
-        # Send initial silence to establish media stream
-        await self.send_silence(ws_id)
+        # Send initial greeting audio
+        await self.send_greeting_audio(ws_id)
     
     async def handle_media_event(self, ws_id, data):
         """Handle incoming media from Twilio"""
@@ -103,71 +102,96 @@ class TwilioMediaHandler:
             try:
                 # Decode the audio
                 audio_chunk = base64.b64decode(payload)
-                log.info("🎵 Received audio chunk: %d bytes", len(audio_chunk))
+                conn['audio_buffer'].extend(audio_chunk)
+                conn['last_audio_time'] = time.time()
                 
-                # Echo back the same audio to test bidirectional streaming
-                await self.send_media_chunk(ws_id, audio_chunk)
+                # When we have enough audio, send a response
+                if len(conn['audio_buffer']) >= 8000:  # ~0.5 seconds of audio
+                    await self.send_response_audio(ws_id)
+                    conn['audio_buffer'].clear()
                 
             except Exception as e:
-                log.error("❌ Error processing media: %s", e)
+                log.error("Error processing media: %s", e)
     
-    async def send_silence(self, ws_id):
-        """Send 100ms of silence to establish media stream"""
+    async def send_greeting_audio(self, ws_id):
+        """Send a simple greeting message"""
         conn = self.connections.get(ws_id)
         if not conn or not conn['stream_sid']:
             return
-            
-        # Generate 100ms of silence (8000 Hz, 16-bit mono)
-        silence = b'\x00' * 1600  # 8000 samples/sec * 2 bytes/sample * 0.1 sec
         
-        media_msg = {
-            "event": "media",
-            "streamSid": conn['stream_sid'],
-            "media": {
-                "track": "outbound",
-                "chunk": str(conn['chunk_counter']),
-                "timestamp": str(int(time.time() * 1000)),
-                "payload": base64.b64encode(silence).decode('ascii')
-            }
-        }
+        # Generate a simple tone as greeting (instead of TTS for now)
+        greeting_audio = self.generate_tone(440, 1000)  # 440Hz tone for 1 second
         
-        try:
-            await conn['ws'].send_str(json.dumps(media_msg))
-            conn['chunk_counter'] += 1
-            log.info("🔊 Sent initial silence media message")
-        except Exception as e:
-            log.error("❌ Failed to send silence: %s", e)
+        log.info("🔊 SENDING GREETING AUDIO - %d bytes", len(greeting_audio))
+        await self.send_audio_chunk(ws_id, greeting_audio)
     
-    async def send_media_chunk(self, ws_id, audio_data):
-        """Send audio chunk back to Twilio"""
+    async def send_response_audio(self, ws_id):
+        """Send response when user speaks"""
         conn = self.connections.get(ws_id)
         if not conn or not conn['stream_sid']:
             return
-            
-        media_msg = {
-            "event": "media",
-            "streamSid": conn['stream_sid'],
-            "media": {
-                "track": "outbound",
-                "chunk": str(conn['chunk_counter']),
-                "timestamp": str(int(time.time() * 1000)),
-                "payload": base64.b64encode(audio_data).decode('ascii')
-            }
-        }
         
-        try:
-            await conn['ws'].send_str(json.dumps(media_msg))
-            conn['chunk_counter'] += 1
-        except Exception as e:
-            log.error("❌ Failed to send media chunk: %s", e)
+        # Generate a different tone as response
+        response_audio = self.generate_tone(550, 1500)  # 550Hz tone for 1.5 seconds
+        
+        log.info("🔊 SENDING RESPONSE AUDIO - %d bytes", len(response_audio))
+        await self.send_audio_chunk(ws_id, response_audio)
+    
+    def generate_tone(self, frequency, duration_ms, sample_rate=8000):
+        """Generate a simple sine wave tone"""
+        import math
+        samples = int(sample_rate * duration_ms / 1000)
+        audio_data = bytearray()
+        
+        for i in range(samples):
+            # Generate sine wave (16-bit signed)
+            sample = int(16000 * math.sin(2 * math.pi * frequency * i / sample_rate))
+            # Convert to 16-bit little endian
+            audio_data.extend([sample & 0xFF, (sample >> 8) & 0xFF])
+        
+        return bytes(audio_data)
+    
+    async def send_audio_chunk(self, ws_id, audio_data):
+        """Send audio chunk to Twilio"""
+        conn = self.connections.get(ws_id)
+        if not conn or not conn['stream_sid']:
+            return
+        
+        # Split audio into smaller chunks for streaming
+        chunk_size = 1600  # 100ms chunks
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i:i + chunk_size]
+            if len(chunk) < chunk_size:
+                # Pad with silence if needed
+                chunk += b'\x00' * (chunk_size - len(chunk))
+            
+            media_msg = {
+                "event": "media",
+                "streamSid": conn['stream_sid'],
+                "media": {
+                    "track": "outbound",
+                    "chunk": str(conn['chunk_counter']),
+                    "timestamp": str(int(time.time() * 1000)),
+                    "payload": base64.b64encode(chunk).decode('ascii')
+                }
+            }
+            
+            try:
+                await conn['ws'].send_str(json.dumps(media_msg))
+                conn['chunk_counter'] += 1
+                log.info("✅ Sent media chunk %d - %d bytes", conn['chunk_counter'], len(chunk))
+                await asyncio.sleep(0.1)  # 100ms between chunks
+            except Exception as e:
+                log.error("❌ Failed to send media chunk: %s", e)
+                break
 
 # Setup application
 handler = TwilioMediaHandler()
 app = web.Application()
 app.router.add_get('/ws', handler.handle_websocket)
-app.router.add_get('/health', lambda r: web.json_response({"status": "ok"}))
+app.router.add_get('/health', lambda r: web.json_response({"status": "ok", "connections": len(handler.connections)}))
 
 if __name__ == '__main__':
     log.info("🚀 Starting Sara Streaming Server on port %d", PORT)
-    log.info("✅ Using Twilio Media Streams protocol")
+    log.info("✅ Media streaming: ACTIVE")
     web.run_app(app, host='0.0.0.0', port=PORT)
