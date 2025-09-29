@@ -348,11 +348,11 @@ routes = web.RouteTableDef()
 async def handle_health(request):
     return web.json_response({"status": "ok", "time": datetime.utcnow().isoformat()})
 
-@routes.get("/ws")
+@r@routes.get("/ws")
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-
+    
     ws_id = str(int(time.time()*1000)) + "_" + str(id(ws))
     CONNS[ws_id] = {
         "buffer": bytearray(),
@@ -367,105 +367,70 @@ async def ws_handler(request):
     meta = CONNS[ws_id]
     log.info("New Twilio WS connected: %s", ws_id)
 
-    # Send simple connected ack (helps Twilio clients if needed)
+    # ✅ CRITICAL FIX: Send the Twilio-specific "connected" event immediately
     try:
-        await ws.send_str(json.dumps({"event": "connected"}))
-    except Exception:
-        # non-fatal; continue
-        pass
+        await ws.send_str(json.dumps({
+            "event": "connected",
+            "protocol": "Call",
+            "version": "1.0.0"
+        }))
+        log.info("Sent Twilio connected event for %s", ws_id)
+    except Exception as e:
+        log.error("Failed to send connected event: %s", e)
 
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 try:
                     j = json.loads(msg.data)
-                except Exception:
-                    log.debug("Non-JSON text message")
-                    continue
-                event = j.get("event")
-                if event == "start":
-                    start = j.get("start", {})
-                    call_sid = start.get("callSid")
-                    sr = start.get("sample_rate") or start.get("sampleRate") or start.get("sampleRateHz") or 8000
-                    meta["call_sid"] = call_sid
-                    meta["sample_rate"] = int(sr)
-                    meta["last_media_ts"] = time.time()
-                    log.info("Stream START ws=%s call_sid=%s sample_rate=%s", ws_id, call_sid, sr)
+                    event = j.get("event")
+                    
+                    if event == "start":
+                        start = j.get("start", {})
+                        call_sid = start.get("callSid")
+                        sr = start.get("sampleRate", 8000)
+                        meta["call_sid"] = call_sid
+                        meta["sample_rate"] = int(sr)
+                        meta["last_media_ts"] = time.time()
+                        log.info("Stream START ws=%s call_sid=%s sample_rate=%s", ws_id, call_sid, sr)
+                        
+                        # ✅ Send media stream ready event
+                        await ws.send_str(json.dumps({
+                            "event": "media",
+                            "media": {
+                                "payload": base64.b64encode(b"\x00" * 320).decode("ascii")
+                            }
+                        }))
 
-                elif event == "media":
-                    media = j.get("media", {})
-                    payload = media.get("payload")
-                    if not payload:
-                        log.debug("Media event missing payload")
-                        continue
-                    try:
-                        chunk = base64.b64decode(payload)
-                    except Exception:
-                        log.exception("Failed to decode payload")
-                        continue
+                    elif event == "media":
+                        media = j.get("media", {})
+                        payload = media.get("payload")
+                        if payload:
+                            try:
+                                chunk = base64.b64decode(payload)
+                                meta["buffer"].extend(chunk)
+                                meta["last_media_ts"] = time.time()
 
-                    # Append to buffer
-                    meta["buffer"].extend(chunk)
-                    meta["last_media_ts"] = time.time()
+                                # If buffer large enough, process it
+                                if len(meta["buffer"]) >= BUFFER_FLUSH_BYTES:
+                                    asyncio.create_task(handle_segment_and_respond(ws_id))
+                                    
+                            except Exception as e:
+                                log.error("Failed to decode media: %s", e)
 
-                    # If we are currently playing back, signal interrupt (barge-in)
-                    if meta["playback_task"] and not meta["playback_task"].done():
-                        meta["interrupt"].set()
-                        # playback will see interrupt flag and stop quickly
-
-                    # If buffer large enough, schedule processing quickly
-                    if len(meta["buffer"]) >= BUFFER_FLUSH_BYTES:
-                        asyncio.create_task(handle_segment_and_respond(ws_id))
-
-                elif event == "stop":
-                    log.info("Stream STOP ws=%s", ws_id)
-                    # final flush if any
-                    if meta["buffer"]:
-                        await handle_segment_and_respond(ws_id)
-                    # let Twilio close the connection
-                    # ensure playback tasks are cancelled/finished
-                    if meta.get("playback_task"):
-                        meta["interrupt"].set()
-                        try:
-                            await asyncio.wait_for(meta["playback_task"], timeout=2.0)
-                        except Exception:
-                            pass
-
-                elif event == "mark":
-                    log.debug("Mark: %s", j.get("timestamp"))
-                else:
-                    log.debug("Unhandled event: %s", event)
-
-            elif msg.type == WSMsgType.ERROR:
-                log.error("WS error %s: %s", ws_id, ws.exception())
-            elif msg.type == WSMsgType.BINARY:
-                log.debug("Binary message received (unexpected) len=%d", len(msg.data))
-
-    except Exception:
-        log.exception("Exception in WS loop for %s", ws_id)
-
+                    elif event == "stop":
+                        log.info("Stream STOP ws=%s", ws_id)
+                        break
+                        
+                except json.JSONDecodeError:
+                    log.warning("Invalid JSON received: %s", msg.data)
+                    
+    except Exception as e:
+        log.error("WebSocket error for %s: %s", ws_id, e)
     finally:
-        # cleanup
         log.info("Closing WS %s", ws_id)
-        try:
-            # interrupt playback if running
-            meta = CONNS.get(ws_id)
-            if meta:
-                if meta.get("playback_task") and not meta["playback_task"].done():
-                    meta["interrupt"].set()
-                    try:
-                        await asyncio.wait_for(meta["playback_task"], timeout=1.0)
-                    except Exception:
-                        pass
-                # close ws if not closed
-                try:
-                    if not ws.closed:
-                        await ws.close()
-                except Exception:
-                    pass
-        except Exception:
-            log.exception("Error during WS final cleanup for %s", ws_id)
         CONNS.pop(ws_id, None)
+        
     return ws
 
 # Cleanup loop (remove old files)
