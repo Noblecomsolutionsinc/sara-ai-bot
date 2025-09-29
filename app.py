@@ -52,17 +52,21 @@ def health():
 def outbound():
     # Optional: inspect Twilio request params
     try:
-        twilio_params = {"CallSid": request.form.get("CallSid"), "To": request.form.get("To"), "From": request.form.get("From")}
+        twilio_params = {
+            "CallSid": request.form.get("CallSid"),
+            "To": request.form.get("To"),
+            "From": request.form.get("From")
+        }
     except Exception:
         twilio_params = {}
     log.info("Outbound TwiML requested by Twilio — params=%s", twilio_params)
 
-    # Return TwiML streaming to PUBLIC_STREAMING_URL
+    # ✅ Bidirectional streaming enabled with track="both_tracks"
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Joanna">Connecting you with Sara, please hold.</Say>
   <Connect>
-    <Stream url="{PUBLIC_STREAMING_URL}" />
+    <Stream url="{PUBLIC_STREAMING_URL}" track="both_tracks" />
   </Connect>
 </Response>
 """
