@@ -315,7 +315,13 @@ async def handle_segment_and_respond(ws_id: str):
                         if interrupt.is_set() or ws_obj.closed:
                             log.info("Playback interrupted for %s", ws_id)
                             break
-                        msg = {"event": "media", "media": {"payload": payload_b64}}
+                        # ✅ FIXED: Twilio-compliant media message
+                        msg = {
+                            "event": "media",
+                            "media": {
+                                "payload": payload_b64
+                            }
+                        }
                         try:
                             await ws_obj.send_str(json.dumps(msg))
                         except Exception as e:
@@ -323,7 +329,6 @@ async def handle_segment_and_respond(ws_id: str):
                             break
                         await asyncio.sleep(0.02)
                 finally:
-                    # Try send event "stop" or nothing; Twilio will manage call lifecycle
                     log.info("Playback finished/stopped for %s", ws_id)
 
             task = asyncio.create_task(playback())
@@ -350,11 +355,7 @@ async def handle_health(request):
 
 @routes.get("/ws")
 async def ws_handler(request):
-    # 🎯 ADD THIS COMPREHENSIVE LOGGING
     log.info("🔍 WebSocket connection attempt received!")
-    log.info("🔍 Remote address: %s", request.remote)
-    log.info("🔍 User-Agent: %s", request.headers.get('User-Agent', 'Unknown'))
-    log.info("🔍 Headers: %s", dict(request.headers))
     
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -371,82 +372,65 @@ async def ws_handler(request):
         "interrupt": asyncio.Event()
     }
     meta = CONNS[ws_id]
-    log.info("🎉 New WebSocket connection: %s", ws_id)
+    log.info("🎉 New Twilio WS connected: %s", ws_id)
 
-    # 🎯 ENHANCED: Send proper Twilio connected event
     try:
-        connected_event = {
+        # ✅ Send Twilio-compliant connected event
+        connected_msg = {
             "event": "connected",
             "protocol": "Call",
             "version": "1.0.0"
         }
-        await ws.send_str(json.dumps(connected_event))
-        log.info("📞 Sent Twilio 'connected' event for %s", ws_id)
-    except Exception as e:
-        log.error("❌ Failed to send connected event: %s", e)
-        return ws
+        await ws.send_str(json.dumps(connected_msg))
+        log.info("📞 Sent Twilio 'connected' event")
 
-    try:
-        log.info("👂 Waiting for messages from Twilio for %s", ws_id)
         async for msg in ws:
-            log.info("📨 Received message type: %s, length: %d", msg.type, len(msg.data))
-            
             if msg.type == WSMsgType.TEXT:
                 try:
-                    j = json.loads(msg.data)
-                    event = j.get("event")
-                    log.info("🔍 Event received: %s", event)
+                    data = json.loads(msg.data)
+                    event = data.get("event")
                     
                     if event == "start":
-                        start = j.get("start", {})
+                        start = data.get("start", {})
                         call_sid = start.get("callSid")
                         sr = start.get("sampleRate", 8000)
                         meta["call_sid"] = call_sid
                         meta["sample_rate"] = int(sr)
-                        meta["last_media_ts"] = time.time()
-                        log.info("🎬 Stream START ws=%s call_sid=%s sample_rate=%s", ws_id, call_sid, sr)
+                        log.info("🎬 Stream START call_sid=%s sample_rate=%s", call_sid, sr)
                         
-                        # 🎯 CRITICAL: Send immediate media to keep connection alive
-                        try:
-                            silence = base64.b64encode(b"\x00" * 1600).decode("ascii")
-                            await ws.send_str(json.dumps({
-                                "event": "media",
-                                "media": {"payload": silence}
-                            }))
-                            log.info("🔊 Sent initial media to keep connection alive")
-                        except Exception as e:
-                            log.error("❌ Failed to send initial media: %s", e)
+                        # ✅ Send initial media to establish stream
+                        silence = base64.b64encode(b"\x00" * 320).decode("ascii")
+                        media_msg = {
+                            "event": "media",
+                            "media": {
+                                "payload": silence
+                            }
+                        }
+                        await ws.send_str(json.dumps(media_msg))
 
                     elif event == "media":
-                        media = j.get("media", {})
+                        media = data.get("media", {})
                         payload = media.get("payload")
                         if payload:
                             try:
                                 chunk = base64.b64decode(payload)
                                 meta["buffer"].extend(chunk)
-                                meta["last_media_ts"] = time.time()
-                                log.debug("🎤 Received media: %d bytes", len(chunk))
-
-                                # If buffer large enough, process it
+                                
                                 if len(meta["buffer"]) >= BUFFER_FLUSH_BYTES:
-                                    log.info("🔄 Buffer full, starting processing")
                                     asyncio.create_task(handle_segment_and_respond(ws_id))
                                     
                             except Exception as e:
-                                log.error("❌ Failed to decode media: %s", e)
+                                log.error("Failed to decode media: %s", e)
 
                     elif event == "stop":
-                        log.info("⏹️ Stream STOP ws=%s", ws_id)
+                        log.info("⏹️ Stream STOP")
                         break
                         
-                except json.JSONDecodeError as e:
-                    log.warning("⚠️ Invalid JSON received: %s", msg.data[:100])
+                except json.JSONDecodeError:
+                    log.warning("Invalid JSON received")
                     
-            elif msg.type == WSMsgType.ERROR:
-                log.error("💥 WebSocket error: %s", ws.exception())
-                
     except Exception as e:
-        log.error("💥 Exception in WebSocket loop: %s", e)
+        log.error("WebSocket error: %s", e)
     finally:
         log.info("🔚 Closing WebSocket: %s", ws_id)
         CONNS.pop(ws_id, None)
