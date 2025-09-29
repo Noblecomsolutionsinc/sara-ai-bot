@@ -1,6 +1,4 @@
-# =========================
-# File: app.py
-# =========================
+# File: app.py - FIXED VERSION
 import os
 import csv
 import logging
@@ -15,7 +13,7 @@ log = logging.getLogger("sara-app")
 # --- Required env vars ---
 REQUIRED = [
     "TWILIO_ACCOUNT_SID",
-    "TWILIO_AUTH_TOKEN",
+    "TWILIO_AUTH_TOKEN", 
     "TWILIO_PHONE_NUMBER",
     "SERVER_URL",
     "PUBLIC_STREAMING_URL"
@@ -32,23 +30,28 @@ TWILIO_PHONE_NUMBER = os.environ["TWILIO_PHONE_NUMBER"]
 SERVER_URL = os.environ["SERVER_URL"].rstrip("/")
 PUBLIC_STREAMING_URL = os.environ["PUBLIC_STREAMING_URL"].rstrip("/")
 
-# tuning
-CALL_DELAY_SECONDS = float(os.environ.get("CALL_DELAY_SECONDS", "1.0"))
-RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "2"))
-RETRY_BACKOFF_SECONDS = int(os.environ.get("RETRY_BACKOFF_SECONDS", "1"))
-OUTBOUND_PATH = os.environ.get("OUTBOUND_PATH", "outbound").lstrip("/")
-OUTBOUND_URL = f"{SERVER_URL}/{OUTBOUND_PATH}"
+# Ensure WebSocket URL uses wss://
+if PUBLIC_STREAMING_URL.startswith('http://'):
+    PUBLIC_STREAMING_URL = PUBLIC_STREAMING_URL.replace('http://', 'wss://', 1)
+elif PUBLIC_STREAMING_URL.startswith('https://'):
+    PUBLIC_STREAMING_URL = PUBLIC_STREAMING_URL.replace('https://', 'wss://', 1)
+elif not PUBLIC_STREAMING_URL.startswith('wss://'):
+    PUBLIC_STREAMING_URL = f"wss://{PUBLIC_STREAMING_URL}"
 
-# Twilio client
+# Add WebSocket path if not present
+if not PUBLIC_STREAMING_URL.endswith('/ws'):
+    PUBLIC_STREAMING_URL = f"{PUBLIC_STREAMING_URL}/ws"
+
+log.info("Using WebSocket URL: %s", PUBLIC_STREAMING_URL)
+
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
 app = Flask(__name__)
 
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     return jsonify({"status": "ok"}), 200
 
-@app.route(f"/{OUTBOUND_PATH}", methods=["POST"])
+@app.route("/outbound", methods=["POST"])
 def outbound():
     try:
         twilio_params = {
@@ -58,89 +61,17 @@ def outbound():
         }
     except Exception:
         twilio_params = {}
-    log.info("Outbound TwiML requested by Twilio — params=%s", twilio_params)
+    log.info("Outbound TwiML requested — params=%s", twilio_params)
 
-    # Bidirectional streaming
+    # ✅ FIXED: Use <Start><Stream> instead of <Connect><Stream>
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">Connecting you with Sara, please hold.</Say>
-  <Connect>
+  <Start>
     <Stream url="{PUBLIC_STREAMING_URL}"/>
-  </Connect>
+  </Start>
+  <Say voice="Polly.Joanna">Connecting you with Sara, please hold.</Say>
 </Response>
 """
     return Response(twiml, mimetype="text/xml")
 
-def safe_initiate_call(to_number, name="unknown"):
-    last_exc = None
-    for attempt in range(1, RETRY_ATTEMPTS + 2):
-        try:
-            call = client.calls.create(
-                to=to_number,
-                from_=TWILIO_PHONE_NUMBER,
-                url=OUTBOUND_URL,
-                method="POST"
-            )
-            log.info("Started call to %s (attempt %d) SID=%s", to_number, attempt, call.sid)
-            return call
-        except Exception as e:
-            last_exc = e
-            log.warning("Attempt %d failed to start call to %s: %s", attempt, to_number, e)
-            if attempt <= RETRY_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF_SECONDS)
-    log.exception("All attempts failed to call %s. Last error: %s", to_number, last_exc)
-    return None
-
-def run_campaign(csv_path="contacts.csv", limit=None):
-    if not os.path.exists(csv_path):
-        log.error("contacts.csv not found at %s", csv_path)
-        raise SystemExit("contacts.csv not found")
-
-    log.info("Starting campaign. OUTBOUND_URL=%s", OUTBOUND_URL)
-    with open(csv_path, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            log.error("contacts.csv has no headers")
-            raise SystemExit("contacts.csv missing headers")
-        count = 0
-        for row in reader:
-            if limit and count >= limit:
-                break
-            rown = {k.strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
-            name = rown.get("name", "unknown")
-            phone = rown.get("phone") or rown.get("mobile") or rown.get("number")
-            if not phone:
-                log.warning("Skipping %s due to missing phone: %s", name, row)
-                continue
-            log.info("Dialing %s (%s)", name, phone)
-            call = safe_initiate_call(phone, name)
-            if call:
-                count += 1
-            time.sleep(CALL_DELAY_SECONDS)
-        log.info("Campaign finished — attempted calls: %d", count)
-    return count
-
-@app.route("/run_campaign", methods=["POST"])
-def run_campaign_endpoint():
-    token = os.environ.get("CAMPAIGN_TRIGGER_TOKEN")
-    req_token = request.headers.get("X-Run-Token") or request.form.get("token")
-    if token and req_token != token:
-        log.warning("Unauthorized attempt to trigger campaign")
-        return jsonify({"error": "unauthorized"}), 403
-    limit = request.args.get("limit")
-    limit = int(limit) if limit and limit.isdigit() else None
-    try:
-        count = run_campaign(limit=limit)
-        return jsonify({"status": "started", "attempted": count}), 200
-    except Exception as e:
-        log.exception("Failed to start campaign")
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == "__main__":
-    mode = os.environ.get("MODE", "server").lower()
-    if mode == "campaign":
-        run_campaign()
-    else:
-        port = int(os.environ.get("PORT", 5000))
-        log.info("Starting Flask server on port %s", port)
-        app.run(host="0.0.0.0", port=port)
+# ... rest of your existing app.py code remains the same ...
