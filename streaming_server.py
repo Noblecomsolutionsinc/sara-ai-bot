@@ -1,10 +1,9 @@
+# =========================
 # File: streaming_server.py
+# =========================
 """
-Production-ready streaming server for Sara.
-- aiohttp WebSocket server for Twilio Media Streams (/ws)
-- STT via OpenAI Whisper, LLM via OpenAI Chat API, TTS via ElevenLabs
-- Converts formats via ffmpeg (ensures ffmpeg is installed)
-- Writes transcripts & mp3s to static/ and rotates old files
+Streaming server: Twilio Media Streams -> Whisper -> Chat -> ElevenLabs -> Twilio
+Copy this file to streaming_server.py and deploy. Reads env for keys.
 """
 import os
 import json
@@ -19,18 +18,17 @@ import subprocess
 import shutil
 from datetime import datetime, timedelta
 from aiohttp import web, ClientSession, WSMsgType
-import aiohttp  # needed for FormData()
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sara-streaming-prod")
 
-# --- Required env vars ---
+# --- Config & env ---
 REQUIRED = [
     "OPENAI_API_KEY",
     "ELEVENLABS_API_KEY",
     "ELEVENLABS_VOICE_ID",
-    "PUBLIC_STREAMING_URL"  # used for generating public MP3 URLs (if needed)
+    "PUBLIC_STREAMING_URL"
 ]
 missing = [v for v in REQUIRED if not os.environ.get(v)]
 if missing:
@@ -38,19 +36,27 @@ if missing:
     raise SystemExit(f"Missing required env vars: {missing}")
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_API_URL = os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1")
+OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "60"))
+OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "1000"))
+
 ELEVEN_API_KEY = os.environ["ELEVENLABS_API_KEY"]
 ELEVEN_VOICE_ID = os.environ["ELEVENLABS_VOICE_ID"]
+ELEVEN_TTS_TIMEOUT = int(os.environ.get("ELEVENLABS_TTS_TIMEOUT", "120"))
+
 PUBLIC_STREAMING_URL = os.environ["PUBLIC_STREAMING_URL"].rstrip("/")
 PORT = int(os.environ.get("PORT", 5001))
 MP3_RETENTION_HOURS = int(os.environ.get("MP3_RETENTION_HOURS", 24))
-BUFFER_FLUSH_BYTES = int(os.environ.get("BUFFER_FLUSH_BYTES", 80 * 1024))  # flush after ~80KB
-TMP_DIR = pathlib.Path("tmp")
-STATIC_DIR = pathlib.Path("static")
-DATA_DIR = pathlib.Path("data")
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
+BUFFER_FLUSH_BYTES = int(os.environ.get("BUFFER_FLUSH_BYTES", 80 * 1024))
 
-# --- Persona loading ---
+DATA_DIR = pathlib.Path("data")
+STATIC_DIR = pathlib.Path("static")
+TMP_DIR = pathlib.Path("tmp")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Persona JSONs load ---
 PERSONA_FILES = [
     "Sara_Opening.json",
     "Sara_Objections.json",
@@ -59,7 +65,6 @@ PERSONA_FILES = [
     "Sara_Playbook.json",
     "Sara_SystemPrompt_Production.json"
 ]
-
 PERSONAS = {}
 for fn in PERSONA_FILES:
     p = DATA_DIR / fn
@@ -70,36 +75,27 @@ for fn in PERSONA_FILES:
         PERSONAS[fn] = json.load(fh)
         log.info("Loaded persona: %s", fn)
 
-# pick system prompt content (supports either string or dict->{prompt})
-SYSTEM_PROMPT = ""
+# Determine system prompt string
 sp = PERSONAS.get("Sara_SystemPrompt_Production.json")
 if isinstance(sp, dict) and "prompt" in sp:
     SYSTEM_PROMPT = sp["prompt"]
 else:
-    # convert other JSON forms into a string representation
     SYSTEM_PROMPT = sp if isinstance(sp, str) else json.dumps(sp, ensure_ascii=False)
-
 log.info("SYSTEM_PROMPT length: %d", len(SYSTEM_PROMPT))
 
-# --- Per-connection state ---
-CONNS = {}  # ws_id -> {buffer: bytearray, call_sid, sample_rate, processing_flag, last_media_ts, ws}
-
-# --- Utilities: ffmpeg conversion ---
+# --- ensure ffmpeg present ---
 def ensure_ffmpeg():
     if shutil.which("ffmpeg") is None:
-        log.error("ffmpeg not found on PATH. Install ffmpeg for audio conversions.")
+        log.error("ffmpeg not found on PATH. Install ffmpeg.")
         raise SystemExit("ffmpeg required")
     try:
-        rv = subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-        log.debug("ffmpeg present: %s", rv.stdout.decode(errors="ignore").splitlines()[0])
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
     except Exception:
         log.error("ffmpeg present but failed to run - check installation")
         raise SystemExit("ffmpeg required")
 
+# Convert raw s16le -> wav (16k) using ffmpeg (blocking, run in executor)
 def raw_bytes_to_wav(raw_path: str, wav_path: str, sample_rate: int = 8000):
-    """
-    Convert raw PCM (s16le) at sample_rate to a WAV file 16kHz mono.
-    """
     cmd = [
         "ffmpeg", "-y",
         "-f", "s16le", "-ar", str(sample_rate), "-ac", "1",
@@ -107,91 +103,25 @@ def raw_bytes_to_wav(raw_path: str, wav_path: str, sample_rate: int = 8000):
         "-ar", "16000", "-ac", "1",
         wav_path
     ]
-    log.debug("Running ffmpeg: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
-        log.error("ffmpeg convert error: %s", proc.stderr.decode(errors="ignore")[:1000])
-        raise RuntimeError("ffmpeg conversion failed")
+        raise RuntimeError(f"ffmpeg conversion failed: {proc.stderr.decode(errors='ignore')[:1000]}")
     return wav_path
 
+# Convert mp3 -> s16le @ out_sample_rate for Twilio playback
 def mp3_to_twilio_raw(mp3_path: str, out_raw_path: str, out_sample_rate: int = 8000):
-    """
-    Convert MP3 to s16le RAW at out_sample_rate for Twilio playback frames.
-    """
     cmd = [
         "ffmpeg", "-y",
         "-i", mp3_path,
         "-f", "s16le", "-ar", str(out_sample_rate), "-ac", "1",
         out_raw_path
     ]
-    log.debug("Running ffmpeg: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
-        log.error("ffmpeg mp3->raw error: %s", proc.stderr.decode(errors="ignore")[:1000])
-        raise RuntimeError("ffmpeg mp3->raw failed")
+        raise RuntimeError(f"ffmpeg mp3->raw failed: {proc.stderr.decode(errors='ignore')[:1000]}")
     return out_raw_path
 
-# --- OpenAI Whisper transcription (async) ---
-async def transcribe_wav_with_openai(wav_path: str, model: str = "whisper-1", timeout: int = 60):
-    url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    # Build multipart form
-    form = aiohttp.FormData()
-    # Using synchronous open; small file reads are acceptable here
-    with open(wav_path, "rb") as fh:
-        form.add_field("file", fh, filename=pathlib.Path(wav_path).name, content_type="audio/wav")
-        form.add_field("model", model)
-        async with ClientSession() as session:
-            async with session.post(url, headers=headers, data=form, timeout=timeout) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    log.error("OpenAI transcription failed %s: %s", resp.status, text[:1000])
-                    return None
-                j = await resp.json()
-                return j.get("text")
-
-# --- OpenAI Chat (async) ---
-async def ask_llm(user_text: str, system_prompt: str = SYSTEM_PROMPT, model: str = "gpt-4o-mini", timeout: int = 60):
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 400
-    }
-    async with ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                log.error("LLM request failed %s: %s", resp.status, text[:1000])
-                return None
-            j = await resp.json()
-            try:
-                return j["choices"][0]["message"]["content"].strip()
-            except Exception:
-                log.error("Unexpected LLM response: %s", j)
-                return None
-
-# --- ElevenLabs TTS (async) ---
-async def eleven_tts_to_mp3(text: str, out_mp3_path: str):
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}/stream"
-    headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
-    payload = {"text": text, "voice_settings": {"stability": 0.6, "similarity_boost": 0.7}}
-    async with ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload, timeout=120) as resp:
-            data = await resp.read()
-            if resp.status != 200:
-                log.error("ElevenLabs TTS failed %s: %s", resp.status, (data[:1000] if data else b""))
-                return None
-            async with aiofiles.open(out_mp3_path, "wb") as fh:
-                await fh.write(data)
-            return out_mp3_path
-
-# --- Twilio-playable media payload builder ---
+# Build base64 payloads from raw file in small chunks
 def build_twilio_media_payload_from_raw(raw_path: str, chunk_size: int = 3200):
     with open(raw_path, "rb") as fh:
         while True:
@@ -200,87 +130,155 @@ def build_twilio_media_payload_from_raw(raw_path: str, chunk_size: int = 3200):
                 break
             yield base64.b64encode(chunk).decode("ascii")
 
-# --- Processing pipeline for one connection ---
+# Transcribe WAV with OpenAI Whisper (multipart POST)
+async def transcribe_wav_with_openai(wav_path: str, model: str = "whisper-1", timeout: int = OPENAI_TIMEOUT):
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    form = aiohttp.FormData()
+    with open(wav_path, "rb") as fh:
+        form.add_field("file", fh, filename=pathlib.Path(wav_path).name, content_type="audio/wav")
+        form.add_field("model", model)
+        async with ClientSession() as session:
+            async with session.post(url, headers=headers, data=form, timeout=timeout) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    log.error("OpenAI transcription failed %s: %s", resp.status, text[:2000])
+                    return None
+                j = await resp.json()
+                return j.get("text")
+
+# Ask LLM via OpenAI chat completions
+async def ask_llm(user_text: str, system_prompt: str = SYSTEM_PROMPT, model: str = "gpt-4o-mini", timeout: int = OPENAI_TIMEOUT):
+    url = f"{OPENAI_API_URL}/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text}
+        ],
+        "temperature": 0.2,
+        "max_tokens": OPENAI_MAX_TOKENS
+    }
+    async with ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                log.error("LLM request failed %s: %s", resp.status, text[:2000])
+                return None
+            j = await resp.json()
+            try:
+                return j["choices"][0]["message"]["content"].strip()
+            except Exception:
+                log.error("Unexpected LLM response: %s", j)
+                return None
+
+# ElevenLabs TTS: POST to streaming endpoint, save mp3
+async def eleven_tts_to_mp3(text: str, out_mp3_path: str):
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}/stream"
+    headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
+    payload = {"text": text, "voice_settings": {"stability": 0.6, "similarity_boost": 0.7}}
+    async with ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload, timeout=ELEVEN_TTS_TIMEOUT) as resp:
+            data = await resp.read()
+            if resp.status != 200:
+                log.error("ElevenLabs TTS failed %s: %s", resp.status, (data[:1000] if data else b""))
+                return None
+            async with aiofiles.open(out_mp3_path, "wb") as fh:
+                await fh.write(data)
+            return out_mp3_path
+
+# --- Per-connection storage ---
+CONNS = {}  # ws_id -> meta: {buffer, call_sid, sample_rate, ws, lock, last_media_ts}
+
 async def process_buffer_and_respond(ws_id: str):
     meta = CONNS.get(ws_id)
     if not meta:
         log.warning("process called with missing meta %s", ws_id)
         return
-    if meta.get("processing"):
-        log.info("Already processing %s", ws_id)
+    lock = meta.get("lock")
+    if lock.locked():
+        # already processing
         return
-    meta["processing"] = True
-    try:
-        buf = meta.get("buffer", bytearray())
-        if not buf:
-            log.info("No audio buffer to process for %s", ws_id)
-            return
-        call_sid = meta.get("call_sid")
-        sample_rate = meta.get("sample_rate", 8000)
-        now_ts = int(time.time())
-        raw_file = TMP_DIR / f"{ws_id}_{now_ts}.s16le"
-        wav_file = TMP_DIR / f"{ws_id}_{now_ts}.wav"
-        mp3_file = STATIC_DIR / f"{ws_id}_{now_ts}.mp3"
-        raw_file.write_bytes(bytes(buf))
-        meta["buffer"] = bytearray()
-
-        # Convert raw PCM to WAV in threadpool
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, raw_bytes_to_wav, str(raw_file), str(wav_file), sample_rate)
-
-        # Transcribe
-        transcript = await transcribe_wav_with_openai(str(wav_file))
-        if not transcript:
-            log.warning("No transcript produced for %s", ws_id)
-            return
-        log.info("Transcript for call %s: %s", call_sid or ws_id, transcript[:400])
-
-        # Ask LLM
-        reply = await ask_llm(transcript)
-        if not reply:
-            log.warning("LLM returned empty response for %s", ws_id)
-            return
-        log.info("LLM reply for %s: %s", ws_id, reply[:500])
-
-        # TTS -> mp3
-        out_mp3 = await eleven_tts_to_mp3(reply, str(mp3_file))
-        if not out_mp3:
-            log.warning("TTS failed for %s", ws_id)
-            return
-
-        # Convert mp3 to raw s16le frames for Twilio
-        raw_for_twilio = TMP_DIR / f"{ws_id}_{now_ts}_twilio.s16le"
-        await loop.run_in_executor(None, mp3_to_twilio_raw, str(mp3_file), str(raw_for_twilio), sample_rate)
-
-        # Stream audio back to Twilio by sending media events
-        ws_obj = meta.get("ws")
-        if not ws_obj:
-            log.warning("No websocket to send response for %s", ws_id)
-            return
-
-        for payload_b64 in build_twilio_media_payload_from_raw(str(raw_for_twilio), chunk_size=3200):
-            msg = {"event": "media", "media": {"payload": payload_b64}}
-            try:
-                await ws_obj.send_str(json.dumps(msg))
-                await asyncio.sleep(0.02)
-            except Exception:
-                log.exception("Failed to send media frame back to Twilio for %s", ws_id)
-                break
-
-        # Save transcript (append) for audit
+    async with lock:
         try:
-            tfn = STATIC_DIR / f"{ws_id}_{now_ts}.txt"
-            async with aiofiles.open(tfn, "w", encoding="utf-8") as tfh:
-                await tfh.write(f"CALL_SID: {call_sid}\n\nTRANSCRIPT:\n{transcript}\n\nLLM_REPLY:\n{reply}\n")
+            buf = meta.get("buffer", bytearray())
+            if not buf:
+                log.info("No audio buffer to process for %s", ws_id)
+                return
+            call_sid = meta.get("call_sid") or ws_id
+            sample_rate = meta.get("sample_rate", 8000)
+            ts = int(time.time())
+            raw_file = TMP_DIR / f"{ws_id}_{ts}.s16le"
+            wav_file = TMP_DIR / f"{ws_id}_{ts}.wav"
+            mp3_file = STATIC_DIR / f"{ws_id}_{ts}.mp3"
+            raw_file.write_bytes(bytes(buf))
+            meta["buffer"] = bytearray()
+
+            # Convert to WAV in threadpool
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, raw_bytes_to_wav, str(raw_file), str(wav_file), sample_rate)
+
+            # Transcribe
+            transcript = await transcribe_wav_with_openai(str(wav_file))
+            if not transcript:
+                log.warning("No transcript produced for %s", ws_id)
+                return
+            log.info("Transcript for call %s: %s", call_sid, transcript[:400])
+
+            # Basic noise / short filtering: ignore too-short transcripts
+            words = transcript.strip().split()
+            if len(words) < 1:
+                log.info("Transcript too short, ignoring for %s", ws_id)
+                return
+
+            # LLM
+            reply = await ask_llm(transcript)
+            if not reply:
+                log.warning("LLM returned empty response for %s", ws_id)
+                return
+            log.info("LLM reply for %s: %s", ws_id, reply[:400])
+
+            # TTS via ElevenLabs
+            out_mp3 = await eleven_tts_to_mp3(reply, str(mp3_file))
+            if not out_mp3:
+                log.warning("TTS failed for %s", ws_id)
+                return
+
+            # Convert mp3 to raw frames for Twilio
+            raw_for_twilio = TMP_DIR / f"{ws_id}_{ts}_twilio.s16le"
+            await loop.run_in_executor(None, mp3_to_twilio_raw, str(mp3_file), str(raw_for_twilio), sample_rate)
+
+            # Stream frames back
+            ws_obj = meta.get("ws")
+            if not ws_obj or ws_obj.closed:
+                log.warning("No websocket to send response for %s", ws_id)
+                return
+
+            for payload_b64 in build_twilio_media_payload_from_raw(str(raw_for_twilio), chunk_size=3200):
+                if ws_obj.closed:
+                    log.info("WS closed mid-stream for %s", ws_id)
+                    break
+                msg = {"event": "media", "media": {"payload": payload_b64}}
+                try:
+                    await ws_obj.send_str(json.dumps(msg))
+                    await asyncio.sleep(0.02)
+                except Exception as e:
+                    log.warning("Failed to send media frame for %s: %s", ws_id, str(e))
+                    break
+
+            # Save transcript & reply audit
+            try:
+                tfn = STATIC_DIR / f"{ws_id}_{ts}.txt"
+                async with aiofiles.open(tfn, "w", encoding="utf-8") as tfh:
+                    await tfh.write(f"CALL_SID: {call_sid}\n\nTRANSCRIPT:\n{transcript}\n\nLLM_REPLY:\n{reply}\n")
+            except Exception:
+                log.exception("Failed to write transcript for %s", ws_id)
+
+            log.info("Finished sending audio back to Twilio for %s", ws_id)
+
         except Exception:
-            log.exception("Failed to write transcript for %s", ws_id)
-
-        log.info("Finished sending audio back to Twilio for %s", ws_id)
-
-    except Exception:
-        log.exception("Error in process_buffer_and_respond for %s", ws_id)
-    finally:
-        meta["processing"] = False
+            log.exception("Error in process_buffer_and_respond for %s", ws_id)
 
 # --- Web handlers ---
 routes = web.RouteTableDef()
@@ -293,8 +291,15 @@ async def handle_health(request):
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    ws_id = str(int(time.time()*1000)) + "_" + str(id(ws))  # quick unique id
-    CONNS[ws_id] = {"buffer": bytearray(), "call_sid": None, "sample_rate": 8000, "processing": False, "ws": ws, "last_media_ts": time.time()}
+    ws_id = str(int(time.time()*1000)) + "_" + str(id(ws))
+    CONNS[ws_id] = {
+        "buffer": bytearray(),
+        "call_sid": None,
+        "sample_rate": 8000,
+        "ws": ws,
+        "lock": asyncio.Lock(),
+        "last_media_ts": time.time()
+    }
     log.info("New Twilio WS connected: %s", ws_id)
 
     try:
@@ -309,7 +314,6 @@ async def ws_handler(request):
                 if event == "start":
                     start = j.get("start", {})
                     call_sid = start.get("callSid")
-                    # Twilio may provide sample_rate in various keys
                     sr = start.get("sample_rate") or start.get("sampleRate") or start.get("sampleRateHz") or 8000
                     CONNS[ws_id]["call_sid"] = call_sid
                     CONNS[ws_id]["sample_rate"] = int(sr)
@@ -329,15 +333,17 @@ async def ws_handler(request):
                         continue
                     CONNS[ws_id]["buffer"].extend(chunk)
                     CONNS[ws_id]["last_media_ts"] = time.time()
-                    # If buffer large enough, schedule processing
+                    # schedule processing if buffer large enough
                     if len(CONNS[ws_id]["buffer"]) >= BUFFER_FLUSH_BYTES:
-                        # schedule background processing
+                        # safe: schedule background task
                         asyncio.create_task(process_buffer_and_respond(ws_id))
+
                 elif event == "stop":
                     log.info("Stream STOP ws=%s", ws_id)
                     # final flush
                     await process_buffer_and_respond(ws_id)
-                    # twilio will close after
+                    # Twilio will likely close after stop
+
                 elif event == "mark":
                     log.debug("Mark: %s", j.get("timestamp"))
                 else:
@@ -358,7 +364,7 @@ async def ws_handler(request):
         CONNS.pop(ws_id, None)
     return ws
 
-# --- Cleanup loop for old files ---
+# Cleanup loop
 async def cleanup_loop():
     while True:
         try:
@@ -382,7 +388,7 @@ async def cleanup_loop():
             log.exception("Cleanup loop error")
         await asyncio.sleep(3600)
 
-# --- App factory ---
+# App factory & main
 def init_app():
     ensure_ffmpeg()
     app = web.Application()
@@ -390,7 +396,6 @@ def init_app():
     app.router.add_static("/static", path=str(STATIC_DIR), show_index=False)
     return app
 
-# --- Start server safely with asyncio.run ---
 async def main():
     app = init_app()
     runner = web.AppRunner(app)
@@ -398,7 +403,6 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info("Streaming server listening on port %d", PORT)
-    # background cleanup
     asyncio.create_task(cleanup_loop())
     # keep running
     while True:

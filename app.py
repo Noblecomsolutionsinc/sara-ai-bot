@@ -1,4 +1,6 @@
+# =========================
 # File: app.py
+# =========================
 import os
 import csv
 import logging
@@ -15,8 +17,8 @@ REQUIRED = [
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
     "TWILIO_PHONE_NUMBER",
-    "SERVER_URL",           # e.g. https://sara-ai-bot.onrender.com
-    "PUBLIC_STREAMING_URL"  # e.g. wss://sara-ai-streaming.onrender.com/ws
+    "SERVER_URL",
+    "PUBLIC_STREAMING_URL"
 ]
 
 missing = [v for v in REQUIRED if not os.environ.get(v)]
@@ -30,8 +32,8 @@ TWILIO_PHONE_NUMBER = os.environ["TWILIO_PHONE_NUMBER"]
 SERVER_URL = os.environ["SERVER_URL"].rstrip("/")
 PUBLIC_STREAMING_URL = os.environ["PUBLIC_STREAMING_URL"].rstrip("/")
 
-# optional tuning envs
-CALL_DELAY_SECONDS = float(os.environ.get("CALL_DELAY_SECONDS", "0.8"))
+# tuning
+CALL_DELAY_SECONDS = float(os.environ.get("CALL_DELAY_SECONDS", "1.0"))
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "2"))
 RETRY_BACKOFF_SECONDS = int(os.environ.get("RETRY_BACKOFF_SECONDS", "1"))
 OUTBOUND_PATH = os.environ.get("OUTBOUND_PATH", "outbound").lstrip("/")
@@ -42,37 +44,35 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app = Flask(__name__)
 
-# Health endpoint (GET + HEAD)
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     return jsonify({"status": "ok"}), 200
 
-# Outbound TwiML handler Twilio will POST to
 @app.route(f"/{OUTBOUND_PATH}", methods=["POST"])
 def outbound():
-    # Optional: inspect Twilio request params
     try:
         twilio_params = {
             "CallSid": request.form.get("CallSid"),
             "To": request.form.get("To"),
-            "From": request.form.get("From")
+            "From": request.form.get("From"),
         }
     except Exception:
         twilio_params = {}
     log.info("Outbound TwiML requested by Twilio — params=%s", twilio_params)
 
-    # ✅ Bidirectional streaming enabled with track="both_tracks"
+    # Bidirectional streaming and a short pause to keep the call alive while AI answers
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Joanna">Connecting you with Sara, please hold.</Say>
   <Connect>
-    <Stream url="{PUBLIC_STREAMING_URL}" track="both_tracks" />
+    <Stream url="{PUBLIC_STREAMING_URL}" track="both_tracks"/>
   </Connect>
+  <!-- keep call open while AI processes -->
+  <Pause length="60"/>
 </Response>
 """
     return Response(twiml, mimetype="text/xml")
 
-# safe call with retries
 def safe_initiate_call(to_number, name="unknown"):
     last_exc = None
     for attempt in range(1, RETRY_ATTEMPTS + 2):
@@ -93,7 +93,6 @@ def safe_initiate_call(to_number, name="unknown"):
     log.exception("All attempts failed to call %s. Last error: %s", to_number, last_exc)
     return None
 
-# Campaign runner: sequential, one at a time
 def run_campaign(csv_path="contacts.csv", limit=None):
     if not os.path.exists(csv_path):
         log.error("contacts.csv not found at %s", csv_path)
@@ -109,7 +108,6 @@ def run_campaign(csv_path="contacts.csv", limit=None):
         for row in reader:
             if limit and count >= limit:
                 break
-            # normalize keys
             rown = {k.strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
             name = rown.get("name", "unknown")
             phone = rown.get("phone") or rown.get("mobile") or rown.get("number")
@@ -120,12 +118,10 @@ def run_campaign(csv_path="contacts.csv", limit=None):
             call = safe_initiate_call(phone, name)
             if call:
                 count += 1
-            # keep calls one at a time with a small delay to avoid bursts
             time.sleep(CALL_DELAY_SECONDS)
         log.info("Campaign finished — attempted calls: %d", count)
     return count
 
-# convenience endpoint to trigger campaign (secured simple token)
 @app.route("/run_campaign", methods=["POST"])
 def run_campaign_endpoint():
     token = os.environ.get("CAMPAIGN_TRIGGER_TOKEN")
@@ -145,10 +141,8 @@ def run_campaign_endpoint():
 if __name__ == "__main__":
     mode = os.environ.get("MODE", "server").lower()
     if mode == "campaign":
-        # when running as a one-off
         run_campaign()
     else:
         port = int(os.environ.get("PORT", 5000))
         log.info("Starting Flask server on port %s", port)
-        # Use Werkzeug dev server; Render uses gunicorn for production by default
         app.run(host="0.0.0.0", port=port)
