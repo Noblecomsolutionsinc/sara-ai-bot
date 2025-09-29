@@ -61,14 +61,12 @@ def outbound():
     log.info("Outbound TwiML requested by Twilio — params=%s", twilio_params)
 
     # Bidirectional streaming and a short pause to keep the call alive while AI answers
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Joanna">Connecting you with Sara, please hold.</Say>
   <Connect>
-    <Stream url="{PUBLIC_STREAMING_URL}" track="both_tracks"/>
+    <Stream url="{PUBLIC_STREAMING_URL}"/>
   </Connect>
-  <!-- keep call open while AI processes -->
-  <Pause length="60"/>
 </Response>
 """
     return Response(twiml, mimetype="text/xml")
