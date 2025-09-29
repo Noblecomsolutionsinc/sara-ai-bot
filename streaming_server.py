@@ -1,16 +1,28 @@
-# File: streaming_server.py - WORKING MINIMAL VERSION
+# File: streaming_server.py - CONVERSATIONAL VERSION
 import os
 import json
 import time
 import base64
 import logging
 import asyncio
-from aiohttp import web, WSMsgType
+import aiohttp
+from aiohttp import web, WSMsgType, ClientSession
+import subprocess
+import pathlib
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sara-streaming")
 
 PORT = int(os.environ.get("PORT", 5001))
+
+# Required APIs
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY") 
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID")
+
+# Directories
+TMP_DIR = pathlib.Path("tmp")
+TMP_DIR.mkdir(exist_ok=True)
 
 class TwilioMediaHandler:
     def __init__(self):
@@ -28,13 +40,14 @@ class TwilioMediaHandler:
             'stream_sid': None,
             'chunk_counter': 0,
             'audio_buffer': bytearray(),
-            'last_audio_time': time.time()
+            'is_processing': False,
+            'conversation_history': []
         }
         
         log.info("🎉 WebSocket connected: %s", ws_id)
         
         try:
-            # 1. Send connected event
+            # Send connected event
             connected_msg = {
                 "event": "connected",
                 "protocol": "Call",
@@ -43,7 +56,7 @@ class TwilioMediaHandler:
             await ws.send_str(json.dumps(connected_msg))
             log.info("✅ Sent 'connected' event")
             
-            # 2. Process incoming messages
+            # Process incoming messages
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
                     try:
@@ -86,13 +99,13 @@ class TwilioMediaHandler:
         
         log.info("🎬 Stream started - stream_sid: %s", stream_sid)
         
-        # Send initial greeting audio
-        await self.send_greeting_audio(ws_id)
+        # Send Sara's greeting
+        await self.send_ai_response(ws_id, "Hello! I'm Sara Hayes. How can I help you today?")
     
     async def handle_media_event(self, ws_id, data):
         """Handle incoming media from Twilio"""
         conn = self.connections.get(ws_id)
-        if not conn or not conn['stream_sid']:
+        if not conn or not conn['stream_sid'] or conn['is_processing']:
             return
             
         media_data = data.get('media', {})
@@ -103,66 +116,182 @@ class TwilioMediaHandler:
                 # Decode the audio
                 audio_chunk = base64.b64decode(payload)
                 conn['audio_buffer'].extend(audio_chunk)
-                conn['last_audio_time'] = time.time()
                 
-                # When we have enough audio, send a response
-                if len(conn['audio_buffer']) >= 8000:  # ~0.5 seconds of audio
-                    await self.send_response_audio(ws_id)
-                    conn['audio_buffer'].clear()
+                # When we have enough audio (about 2 seconds), process it
+                if len(conn['audio_buffer']) >= 32000:  # ~2 seconds of audio
+                    conn['is_processing'] = True
+                    asyncio.create_task(self.process_user_speech(ws_id))
                 
             except Exception as e:
                 log.error("Error processing media: %s", e)
     
-    async def send_greeting_audio(self, ws_id):
-        """Send a simple greeting message"""
+    async def process_user_speech(self, ws_id):
+        """Process user speech and generate AI response"""
         conn = self.connections.get(ws_id)
-        if not conn or not conn['stream_sid']:
+        if not conn:
+            return
+            
+        try:
+            # Save audio to file
+            audio_data = bytes(conn['audio_buffer'])
+            conn['audio_buffer'].clear()  # Clear buffer after processing
+            
+            timestamp = int(time.time())
+            raw_path = TMP_DIR / f"user_{ws_id}_{timestamp}.raw"
+            wav_path = TMP_DIR / f"user_{ws_id}_{timestamp}.wav"
+            
+            raw_path.write_bytes(audio_data)
+            
+            # Convert to WAV for transcription
+            await self.convert_audio(raw_path, wav_path, conn['sample_rate'])
+            
+            # Transcribe using Whisper
+            transcript = await self.transcribe_audio(wav_path)
+            
+            if transcript and len(transcript.strip()) > 5:  # Minimum 5 characters
+                log.info("🎙️ User said: %s", transcript)
+                
+                # Get AI response
+                response = await self.get_ai_response(transcript, conn['conversation_history'])
+                if response:
+                    log.info("🤖 Sara responds: %s", response)
+                    
+                    # Add to conversation history
+                    conn['conversation_history'].append({"role": "user", "content": transcript})
+                    conn['conversation_history'].append({"role": "assistant", "content": response})
+                    
+                    # Keep only last 6 messages to manage context
+                    if len(conn['conversation_history']) > 6:
+                        conn['conversation_history'] = conn['conversation_history'][-6:]
+                    
+                    # Convert to speech and stream
+                    await self.send_ai_response(ws_id, response)
+                else:
+                    log.warning("No AI response generated")
+            else:
+                log.info("No speech detected or transcript too short")
+            
+        except Exception as e:
+            log.error("❌ Error in speech processing: %s", e)
+        finally:
+            conn['is_processing'] = False
+    
+    async def convert_audio(self, input_path, output_path, sample_rate):
+        """Convert raw audio to WAV"""
+        loop = asyncio.get_running_loop()
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "s16le", "-ar", str(sample_rate), "-ac", "1",
+            "-i", str(input_path),
+            "-ar", "16000", "-ac", "1",
+            str(output_path)
+        ]
+        process = await loop.run_in_executor(None, lambda: subprocess.run(cmd, capture_output=True))
+        if process.returncode != 0:
+            log.error("FFmpeg conversion failed: %s", process.stderr.decode())
+    
+    async def transcribe_audio(self, wav_path):
+        """Transcribe audio using Whisper"""
+        if not OPENAI_API_KEY:
+            log.warning("No OpenAI API key - using test transcription")
+            return "This is a test transcription. Please configure your OpenAI API key."
+            
+        url = "https://api.openai.com/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        
+        try:
+            form = aiohttp.FormData()
+            with open(wav_path, "rb") as f:
+                form.add_field("file", f, filename="audio.wav", content_type="audio/wav")
+                form.add_field("model", "whisper-1")
+                
+                async with ClientSession() as session:
+                    async with session.post(url, headers=headers, data=form, timeout=30) as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                            return result.get("text", "").strip()
+                        else:
+                            error_text = await resp.text()
+                            log.error("❌ Transcription failed: %s", error_text)
+                            return None
+        except Exception as e:
+            log.error("❌ Transcription error: %s", e)
+            return None
+    
+    async def get_ai_response(self, user_message, conversation_history):
+        """Get response from AI"""
+        if not OPENAI_API_KEY:
+            return "I heard you speak! This is Sara Hayes. To enable full AI conversations, please configure your OpenAI API key."
+        
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        # Build conversation context
+        messages = [
+            {
+                "role": "system", 
+                "content": """You are Sara Hayes, a friendly and professional AI assistant. 
+                Keep your responses conversational, brief (1-2 sentences), and natural for voice conversation.
+                Speak like you're on a phone call - be warm and engaging."""
+            }
+        ]
+        
+        # Add conversation history
+        messages.extend(conversation_history)
+        
+        # Add current user message
+        messages.append({"role": "user", "content": user_message})
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 150
+        }
+        
+        try:
+            async with ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload, timeout=30) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        return result["choices"][0]["message"]["content"].strip()
+                    else:
+                        error_text = await resp.text()
+                        log.error("❌ AI response failed: %s", error_text)
+                        return f"I understand you said: {user_message}. Please configure your AI API keys for full functionality."
+        except Exception as e:
+            log.error("❌ AI response error: %s", e)
+            return "I heard what you said, but I'm having trouble processing it right now. Could you try again?"
+    
+    async def send_ai_response(self, ws_id, text):
+        """Convert text to speech and stream to Twilio"""
+        conn = self.connections.get(ws_id)
+        if not conn:
             return
         
-        # Generate a simple tone as greeting (instead of TTS for now)
-        greeting_audio = self.generate_tone(440, 1000)  # 440Hz tone for 1 second
-        
-        log.info("🔊 SENDING GREETING AUDIO - %d bytes", len(greeting_audio))
-        await self.send_audio_chunk(ws_id, greeting_audio)
+        # For now, use fallback audio - you can implement ElevenLabs TTS here
+        await self.send_fallback_audio(ws_id, text)
     
-    async def send_response_audio(self, ws_id):
-        """Send response when user speaks"""
+    async def send_fallback_audio(self, ws_id, text):
+        """Send fallback audio (you can replace with ElevenLabs TTS)"""
         conn = self.connections.get(ws_id)
-        if not conn or not conn['stream_sid']:
+        if not conn:
             return
         
-        # Generate a different tone as response
-        response_audio = self.generate_tone(550, 1500)  # 550Hz tone for 1.5 seconds
+        # Generate audio based on text length
+        duration_ms = min(len(text) * 100, 5000)  # Max 5 seconds
+        tone_frequency = 440 if "hello" in text.lower() else 550
         
-        log.info("🔊 SENDING RESPONSE AUDIO - %d bytes", len(response_audio))
-        await self.send_audio_chunk(ws_id, response_audio)
-    
-    def generate_tone(self, frequency, duration_ms, sample_rate=8000):
-        """Generate a simple sine wave tone"""
-        import math
-        samples = int(sample_rate * duration_ms / 1000)
-        audio_data = bytearray()
+        audio_data = self.generate_tone(tone_frequency, duration_ms)
         
-        for i in range(samples):
-            # Generate sine wave (16-bit signed)
-            sample = int(16000 * math.sin(2 * math.pi * frequency * i / sample_rate))
-            # Convert to 16-bit little endian
-            audio_data.extend([sample & 0xFF, (sample >> 8) & 0xFF])
-        
-        return bytes(audio_data)
-    
-    async def send_audio_chunk(self, ws_id, audio_data):
-        """Send audio chunk to Twilio"""
-        conn = self.connections.get(ws_id)
-        if not conn or not conn['stream_sid']:
-            return
-        
-        # Split audio into smaller chunks for streaming
+        # Stream the audio
         chunk_size = 1600  # 100ms chunks
         for i in range(0, len(audio_data), chunk_size):
             chunk = audio_data[i:i + chunk_size]
             if len(chunk) < chunk_size:
-                # Pad with silence if needed
                 chunk += b'\x00' * (chunk_size - len(chunk))
             
             media_msg = {
@@ -179,11 +308,24 @@ class TwilioMediaHandler:
             try:
                 await conn['ws'].send_str(json.dumps(media_msg))
                 conn['chunk_counter'] += 1
-                log.info("✅ Sent media chunk %d - %d bytes", conn['chunk_counter'], len(chunk))
                 await asyncio.sleep(0.1)  # 100ms between chunks
             except Exception as e:
-                log.error("❌ Failed to send media chunk: %s", e)
+                log.error("❌ Failed to send audio: %s", e)
                 break
+        
+        log.info("✅ Sent AI response audio: '%s'", text[:50] + "..." if len(text) > 50 else text)
+    
+    def generate_tone(self, frequency, duration_ms, sample_rate=8000):
+        """Generate a simple sine wave tone (fallback)"""
+        import math
+        samples = int(sample_rate * duration_ms / 1000)
+        audio_data = bytearray()
+        
+        for i in range(samples):
+            sample = int(16000 * math.sin(2 * math.pi * frequency * i / sample_rate))
+            audio_data.extend([sample & 0xFF, (sample >> 8) & 0xFF])
+        
+        return bytes(audio_data)
 
 # Setup application
 handler = TwilioMediaHandler()
@@ -194,4 +336,6 @@ app.router.add_get('/health', lambda r: web.json_response({"status": "ok", "conn
 if __name__ == '__main__':
     log.info("🚀 Starting Sara Streaming Server on port %d", PORT)
     log.info("✅ Media streaming: ACTIVE")
+    log.info("🎙️ Speech recognition: READY")
+    log.info("🤖 AI conversation: ENABLED")
     web.run_app(app, host='0.0.0.0', port=PORT)
