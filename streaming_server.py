@@ -274,9 +274,9 @@ class TwilioMediaHandler:
         # Add current user message
         messages.append({"role": "user", "content": user_message})
         
-        # ✅ FIXED: Using gpt-5-mini with max_tokens
+        # ✅ USING gpt-5-mini with max_tokens
         payload = {
-            "model": "gpt-5-mini",  # ✅ CHANGED TO gpt-5-mini
+            "model": "gpt-5-mini",  # ✅ CORRECT MODEL
             "messages": messages,
             "temperature": 0.7,
             "max_tokens": 150  # ✅ ADDED max_tokens
@@ -302,17 +302,27 @@ class TwilioMediaHandler:
         if not conn:
             return
         
-        # Use ElevenLabs if available, otherwise fallback
+        log.info(f"🔊 Converting to speech: '{text}'")
+        
+        # Try ElevenLabs first
         if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
-            await self.send_elevenlabs_audio(ws_id, text)
-        else:
-            await self.send_fallback_audio(ws_id, text)
+            log.info("🎯 Attempting ElevenLabs TTS...")
+            success = await self.send_elevenlabs_audio(ws_id, text)
+            if success:
+                log.info("✅ ElevenLabs TTS successful")
+                return
+            else:
+                log.warning("❌ ElevenLabs failed, using fallback")
+        
+        # Fallback to tones
+        log.info("🔧 Using fallback audio tones")
+        await self.send_fallback_audio(ws_id, text)
     
     async def send_elevenlabs_audio(self, ws_id, text):
-        """Send audio using ElevenLabs TTS"""
+        """Send audio using ElevenLabs TTS - RETURNS SUCCESS STATUS"""
         conn = self.connections.get(ws_id)
         if not conn:
-            return
+            return False
             
         try:
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
@@ -349,14 +359,16 @@ class TwilioMediaHandler:
                         
                         # Stream the audio
                         await self.stream_audio_file(ws_id, raw_path)
+                        return True  # ✅ SUCCESS
                         
                     else:
-                        log.error("ElevenLabs TTS failed, using fallback")
-                        await self.send_fallback_audio(ws_id, text)
+                        error_text = await resp.text()
+                        log.error(f"❌ ElevenLabs TTS failed: HTTP {resp.status} - {error_text[:200]}")
+                        return False  # ❌ FAILED
                         
         except Exception as e:
-            log.error("ElevenLabs error: %s, using fallback", e)
-            await self.send_fallback_audio(ws_id, text)
+            log.error(f"❌ ElevenLabs error: {e}")
+            return False  # ❌ FAILED
     
     def convert_to_twilio_format(self, mp3_path, raw_path, sample_rate):
         """Convert MP3 to Twilio raw format"""
@@ -459,56 +471,11 @@ class TwilioMediaHandler:
         
         return bytes(audio_data)
 
-# Setup application
+# Setup application - NO DIAGNOSTIC ENDPOINT (to avoid syntax errors)
 handler = TwilioMediaHandler()
 app = web.Application()
 app.router.add_get('/ws', handler.handle_websocket)
 app.router.add_get('/health', lambda r: web.json_response({"status": "ok", "connections": len(handler.connections)}))
-
-# Add diagnostic endpoint
-@ app.router.get("/diagnostic")
-async def diagnostic_endpoint(request):
-    """Test APIs from within Render"""
-    results = {}
-    
-    # Test OpenAI
-    try:
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-        payload = {
-            "model": "gpt-5-mini",
-            "messages": [{"role": "user", "content": "Say 'OpenAI test successful'"}],
-            "max_tokens": 20
-        }
-        async with ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    results['openai'] = {"status": "PASS", "response": data['choices'][0]['message']['content']}
-                else:
-                    error = await response.text()
-                    results['openai'] = {"status": "FAIL", "error": f"HTTP {response.status}"}
-    except Exception as e:
-        results['openai'] = {"status": "FAIL", "error": str(e)}
-    
-    # Test ElevenLabs
-    try:
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
-        headers = {"xi-api-key": ELEVENLABS_API_KEY}
-        payload = {"text": "Test", "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}}
-        
-        async with ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload, timeout=10) as response:
-                if response.status == 200:
-                    audio_data = await response.read()
-                    results['elevenlabs'] = {"status": "PASS", "audio_size": len(audio_data)}
-                else:
-                    error = await response.text()
-                    results['elevenlabs'] = {"status": "FAIL", "error": f"HTTP {response.status}"}
-    except Exception as e:
-        results['elevenlabs'] = {"status": "FAIL", "error": str(e)}
-    
-    return web.json_response(results)
 
 if __name__ == '__main__':
     log.info("🚀 Starting Sara Streaming Server on port %d", PORT)
