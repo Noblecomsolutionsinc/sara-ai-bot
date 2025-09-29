@@ -225,7 +225,7 @@ async def eleven_tts_to_mp3(text: str, out_mp3_path: str):
 
 # --- Per-connection state ---
 # CONNS keyed by ws_id -> meta dict:
-# { "buffer": bytearray(), "call_sid": str, "sample_rate": int, "ws": ws, "lock": asyncio.Lock(),
+# { "buffer": bytearray(), "call_sid": str, "stream_sid": str, "sample_rate": int, "ws": ws, "lock": asyncio.Lock(),
 #   "last_media_ts": float, "playback_task": Task|None, "interrupt": asyncio.Event() }
 CONNS = {}
 
@@ -307,17 +307,23 @@ async def handle_segment_and_respond(ws_id: str):
             # playback coroutine
             async def playback():
                 ws_obj = meta.get("ws")
+                stream_sid = meta.get("stream_sid")
                 if not ws_obj or ws_obj.closed:
                     log.warning("WS closed before playback for %s", ws_id)
                     return
+                if not stream_sid:
+                    log.error("No stream_sid for playback in %s", ws_id)
+                    return
+                    
                 try:
                     for payload_b64 in build_twilio_media_payload_from_raw(str(raw_for_twilio), chunk_size=3200):
                         if interrupt.is_set() or ws_obj.closed:
                             log.info("Playback interrupted for %s", ws_id)
                             break
-                        # ✅ FIXED: Twilio-compliant media message
+                        # ✅ FIXED: Twilio-compliant media message with streamSid
                         msg = {
                             "event": "media",
+                            "streamSid": stream_sid,
                             "media": {
                                 "payload": payload_b64
                             }
@@ -364,6 +370,7 @@ async def ws_handler(request):
     CONNS[ws_id] = {
         "buffer": bytearray(),
         "call_sid": None,
+        "stream_sid": None,  # ✅ Added stream_sid storage
         "sample_rate": 8000,
         "ws": ws,
         "lock": asyncio.Lock(),
@@ -375,7 +382,7 @@ async def ws_handler(request):
     log.info("🎉 New Twilio WS connected: %s", ws_id)
 
     try:
-        # ✅ Send Twilio-compliant connected event
+        # ✅ Send Twilio-compliant connected event (NO streamSid needed here)
         connected_msg = {
             "event": "connected",
             "protocol": "Call",
@@ -393,20 +400,24 @@ async def ws_handler(request):
                     if event == "start":
                         start = data.get("start", {})
                         call_sid = start.get("callSid")
+                        stream_sid = start.get("streamSid")  # ✅ Capture streamSid
                         sr = start.get("sampleRate", 8000)
                         meta["call_sid"] = call_sid
+                        meta["stream_sid"] = stream_sid  # ✅ Store streamSid
                         meta["sample_rate"] = int(sr)
-                        log.info("🎬 Stream START call_sid=%s sample_rate=%s", call_sid, sr)
+                        log.info("🎬 Stream START call_sid=%s stream_sid=%s sample_rate=%s", call_sid, stream_sid, sr)
                         
-                        # ✅ Send initial media to establish stream
+                        # ✅ Send initial media to establish stream (WITH streamSid)
                         silence = base64.b64encode(b"\x00" * 320).decode("ascii")
                         media_msg = {
                             "event": "media",
+                            "streamSid": stream_sid,  # ✅ Added streamSid
                             "media": {
                                 "payload": silence
                             }
                         }
                         await ws.send_str(json.dumps(media_msg))
+                        log.info("🔊 Sent initial silence media with streamSid")
 
                     elif event == "media":
                         media = data.get("media", {})
