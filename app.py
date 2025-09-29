@@ -1,4 +1,4 @@
-# app.py
+# File: app.py
 import os
 import csv
 import logging
@@ -34,8 +34,8 @@ PUBLIC_STREAMING_URL = os.environ["PUBLIC_STREAMING_URL"].rstrip("/")
 CALL_DELAY_SECONDS = float(os.environ.get("CALL_DELAY_SECONDS", "0.8"))
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "2"))
 RETRY_BACKOFF_SECONDS = int(os.environ.get("RETRY_BACKOFF_SECONDS", "1"))
-OUTBOUND_PATH = os.environ.get("OUTBOUND_PATH", "outbound")
-OUTBOUND_URL = f"{SERVER_URL}/{OUTBOUND_PATH.lstrip('/')}"
+OUTBOUND_PATH = os.environ.get("OUTBOUND_PATH", "outbound").lstrip("/")
+OUTBOUND_URL = f"{SERVER_URL}/{OUTBOUND_PATH}"
 
 # Twilio client
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)

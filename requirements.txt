@@ -1,17 +1,21 @@
-# Flask and server
+# File: requirements.txt
 Flask>=3.0
-python-dotenv
+python-dotenv>=1.0
 requests>=2.31.0
 twilio>=8.0
 gunicorn>=20.1
 
-# Streaming server
+# Streaming server & async
+aiohttp>=3.9.0
+aiofiles>=23.2.1
 websockets>=11.0
+
+# Audio / processing
 pydub>=0.25.1
 soundfile>=0.12.1
 numpy>=1.26.0
-aiohttp>=3.9.0
-aiofiles>=23.2.1
 
-# OpenAI for AI conversations
+# OpenAI & utilities
 openai>=1.32.0
+
+# Misc / dev
