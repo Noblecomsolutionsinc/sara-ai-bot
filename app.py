@@ -1,124 +1,150 @@
-# streaming_server.py
+# app.py
 import os
-import asyncio
+import csv
 import logging
-import base64
-import tempfile
 import time
-from datetime import datetime, timedelta
-from pathlib import Path
-import json
-import websockets
-import aiofiles
-import requests
+from flask import Flask, Response, jsonify, request
+from twilio.rest import Client
 
+# --- Logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("sara-app")
 
-# --- Load environment ---
+# --- Required env vars ---
 REQUIRED = [
-    "OPENAI_API_KEY",
-    "ELEVENLABS_API_KEY",
-    "ELEVENLABS_VOICE_ID",
-    "PUBLIC_STREAMING_URL",
-    "MP3_RETENTION_HOURS"
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_PHONE_NUMBER",
+    "SERVER_URL",           # e.g. https://sara-ai-bot.onrender.com
+    "PUBLIC_STREAMING_URL"  # e.g. wss://sara-ai-streaming.onrender.com/ws
 ]
+
 missing = [v for v in REQUIRED if not os.environ.get(v)]
 if missing:
-    logging.error("Missing required env vars: %s", missing)
+    log.error("Missing required env vars: %s", missing)
     raise SystemExit(f"Missing required env vars: {missing}")
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
-ELEVENLABS_VOICE_ID = os.environ["ELEVENLABS_VOICE_ID"]
-MP3_RETENTION_HOURS = int(os.environ.get("MP3_RETENTION_HOURS", 24))
-PUBLIC_STREAMING_URL = os.environ["PUBLIC_STREAMING_URL"]
+TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_PHONE_NUMBER = os.environ["TWILIO_PHONE_NUMBER"]
+SERVER_URL = os.environ["SERVER_URL"].rstrip("/")
+PUBLIC_STREAMING_URL = os.environ["PUBLIC_STREAMING_URL"].rstrip("/")
 
-# Temporary folder for audio
-TMP_DIR = Path("tmp_audio")
-TMP_DIR.mkdir(exist_ok=True)
+# optional tuning envs
+CALL_DELAY_SECONDS = float(os.environ.get("CALL_DELAY_SECONDS", "0.8"))
+RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "2"))
+RETRY_BACKOFF_SECONDS = int(os.environ.get("RETRY_BACKOFF_SECONDS", "1"))
+OUTBOUND_PATH = os.environ.get("OUTBOUND_PATH", "outbound")
+OUTBOUND_URL = f"{SERVER_URL}/{OUTBOUND_PATH.lstrip('/')}"
 
-# --- Helpers ---
-async def cleanup_old_files():
-    now = datetime.utcnow()
-    cutoff = now - timedelta(hours=MP3_RETENTION_HOURS)
-    for f in TMP_DIR.glob("*"):
-        if datetime.utcfromtimestamp(f.stat().st_mtime) < cutoff:
-            try:
-                f.unlink()
-                logging.info("Deleted old temp file: %s", f)
-            except Exception as e:
-                logging.warning("Failed to delete temp file %s: %s", f, e)
+# Twilio client
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-async def call_openai(messages):
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "gpt-4o-mini",  # can be changed via env if needed
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 500
-    }
-    resp = requests.post(url, headers=headers, json=data, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+app = Flask(__name__)
 
-async def call_elevenlabs_tts(text, filename):
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
-    payload = {"text": text, "voice_settings": {"stability": 0.75, "similarity_boost": 0.75}}
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    async with aiofiles.open(filename, "wb") as f:
-        await f.write(resp.content)
-    logging.info("TTS audio written to %s", filename)
+# Health endpoint (GET + HEAD)
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
-# --- WebSocket handler ---
-async def handle_call(websocket, path):
-    logging.info("New call connection from Twilio")
-    messages = [{"role": "system", "content": "You are Sara, a friendly outbound consultant."}]
-    tmp_wav = TMP_DIR / f"sara_{int(time.time())}.wav"
-
+# Outbound TwiML handler Twilio will POST to
+@app.route(f"/{OUTBOUND_PATH}", methods=["POST"])
+def outbound():
+    # Optional: inspect Twilio request params
     try:
-        async for msg in websocket:
-            data = json.loads(msg)
-            event_type = data.get("event")
-            if event_type == "start":
-                logging.info("Call started: %s", data)
-            elif event_type == "media":
-                payload = data.get("media", {}).get("payload")
-                if payload:
-                    audio_bytes = base64.b64decode(payload)
-                    async with aiofiles.open(tmp_wav, "ab") as f:
-                        await f.write(audio_bytes)
-            elif event_type == "stop":
-                logging.info("Call ended")
-                # Process accumulated audio with OpenAI / generate response
-                user_text = "Simulated transcript"  # Replace with STT if needed
-                messages.append({"role": "user", "content": user_text})
-                reply_text = await asyncio.to_thread(call_openai, messages)
-                messages.append({"role": "assistant", "content": reply_text})
-                tts_file = TMP_DIR / f"sara_reply_{int(time.time())}.mp3"
-                await call_elevenlabs_tts(reply_text, tts_file)
-                logging.info("Call finished, response TTS ready: %s", tts_file)
-    except websockets.exceptions.ConnectionClosedOK:
-        logging.info("Call connection closed normally")
-    except Exception as e:
-        logging.exception("Error during call handling: %s", e)
-    finally:
-        if tmp_wav.exists():
-            tmp_wav.unlink(missing_ok=True)
+        twilio_params = {"CallSid": request.form.get("CallSid"), "To": request.form.get("To"), "From": request.form.get("From")}
+    except Exception:
+        twilio_params = {}
+    log.info("Outbound TwiML requested by Twilio — params=%s", twilio_params)
 
-# --- Start server ---
-async def main():
-    await cleanup_old_files()
-    host = "0.0.0.0"
-    port = int(os.environ.get("PORT", 8765))
-    logging.info("Starting WebSocket streaming server on %s:%s", host, port)
-    async with websockets.serve(handle_call, host, port):
-        await asyncio.Future()  # run forever
+    # Return TwiML streaming to PUBLIC_STREAMING_URL
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna">Connecting you with Sara, please hold.</Say>
+  <Connect>
+    <Stream url="{PUBLIC_STREAMING_URL}" />
+  </Connect>
+</Response>
+"""
+    return Response(twiml, mimetype="text/xml")
+
+# safe call with retries
+def safe_initiate_call(to_number, name="unknown"):
+    last_exc = None
+    for attempt in range(1, RETRY_ATTEMPTS + 2):
+        try:
+            call = client.calls.create(
+                to=to_number,
+                from_=TWILIO_PHONE_NUMBER,
+                url=OUTBOUND_URL,
+                method="POST"
+            )
+            log.info("Started call to %s (attempt %d) SID=%s", to_number, attempt, call.sid)
+            return call
+        except Exception as e:
+            last_exc = e
+            log.warning("Attempt %d failed to start call to %s: %s", attempt, to_number, e)
+            if attempt <= RETRY_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS)
+    log.exception("All attempts failed to call %s. Last error: %s", to_number, last_exc)
+    return None
+
+# Campaign runner: sequential, one at a time
+def run_campaign(csv_path="contacts.csv", limit=None):
+    if not os.path.exists(csv_path):
+        log.error("contacts.csv not found at %s", csv_path)
+        raise SystemExit("contacts.csv not found")
+
+    log.info("Starting campaign. OUTBOUND_URL=%s", OUTBOUND_URL)
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            log.error("contacts.csv has no headers")
+            raise SystemExit("contacts.csv missing headers")
+        count = 0
+        for row in reader:
+            if limit and count >= limit:
+                break
+            # normalize keys
+            rown = {k.strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+            name = rown.get("name", "unknown")
+            phone = rown.get("phone") or rown.get("mobile") or rown.get("number")
+            if not phone:
+                log.warning("Skipping %s due to missing phone: %s", name, row)
+                continue
+            log.info("Dialing %s (%s)", name, phone)
+            call = safe_initiate_call(phone, name)
+            if call:
+                count += 1
+            # keep calls one at a time with a small delay to avoid bursts
+            time.sleep(CALL_DELAY_SECONDS)
+        log.info("Campaign finished — attempted calls: %d", count)
+    return count
+
+# convenience endpoint to trigger campaign (secured simple token)
+@app.route("/run_campaign", methods=["POST"])
+def run_campaign_endpoint():
+    token = os.environ.get("CAMPAIGN_TRIGGER_TOKEN")
+    req_token = request.headers.get("X-Run-Token") or request.form.get("token")
+    if token and req_token != token:
+        log.warning("Unauthorized attempt to trigger campaign")
+        return jsonify({"error": "unauthorized"}), 403
+    limit = request.args.get("limit")
+    limit = int(limit) if limit and limit.isdigit() else None
+    try:
+        count = run_campaign(limit=limit)
+        return jsonify({"status": "started", "attempted": count}), 200
+    except Exception as e:
+        log.exception("Failed to start campaign")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    mode = os.environ.get("MODE", "server").lower()
+    if mode == "campaign":
+        # when running as a one-off
+        run_campaign()
+    else:
+        port = int(os.environ.get("PORT", 5000))
+        log.info("Starting Flask server on port %s", port)
+        # Use Werkzeug dev server; Render uses gunicorn for production by default
+        app.run(host="0.0.0.0", port=port)
