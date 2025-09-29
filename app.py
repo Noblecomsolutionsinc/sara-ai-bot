@@ -1,4 +1,4 @@
-# File: app.py - FIXED VERSION
+# File: app.py
 import os
 import csv
 import logging
@@ -22,7 +22,6 @@ REQUIRED = [
 missing = [v for v in REQUIRED if not os.environ.get(v)]
 if missing:
     log.error("Missing required env vars: %s", missing)
-    # Don't exit - Render might have them set
     log.warning("Some environment variables missing, but continuing...")
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")

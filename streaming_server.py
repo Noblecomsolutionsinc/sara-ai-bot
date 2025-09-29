@@ -1,4 +1,4 @@
-# File: streaming_server.py - RESPONSIVE VERSION
+# File: streaming_server.py
 import os
 import json
 import time
@@ -10,7 +10,12 @@ from aiohttp import web, WSMsgType, ClientSession
 import subprocess
 import pathlib
 
-logging.basicConfig(level=logging.INFO)
+# Enhanced logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
 log = logging.getLogger("sara-streaming")
 
 PORT = int(os.environ.get("PORT", 5001))
@@ -269,16 +274,17 @@ class TwilioMediaHandler:
         # Add current user message
         messages.append({"role": "user", "content": user_message})
         
+        # ✅ FIXED: Using gpt-5-mini with max_tokens
         payload = {
-            "model": "gpt-4o-mini",
+            "model": "gpt-5-mini",  # ✅ CHANGED TO gpt-5-mini
             "messages": messages,
             "temperature": 0.7,
-            "max_tokens": 100  # Shorter responses for voice
+            "max_tokens": 150  # ✅ ADDED max_tokens
         }
         
         try:
             async with ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload, timeout=20) as resp:
+                async with session.post(url, headers=headers, json=payload, timeout=30) as resp:
                     if resp.status == 200:
                         result = await resp.json()
                         return result["choices"][0]["message"]["content"].strip()
@@ -459,10 +465,55 @@ app = web.Application()
 app.router.add_get('/ws', handler.handle_websocket)
 app.router.add_get('/health', lambda r: web.json_response({"status": "ok", "connections": len(handler.connections)}))
 
+# Add diagnostic endpoint
+@ app.router.get("/diagnostic")
+async def diagnostic_endpoint(request):
+    """Test APIs from within Render"""
+    results = {}
+    
+    # Test OpenAI
+    try:
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        payload = {
+            "model": "gpt-5-mini",
+            "messages": [{"role": "user", "content": "Say 'OpenAI test successful'"}],
+            "max_tokens": 20
+        }
+        async with ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    results['openai'] = {"status": "PASS", "response": data['choices'][0]['message']['content']}
+                else:
+                    error = await response.text()
+                    results['openai'] = {"status": "FAIL", "error": f"HTTP {response.status}"}
+    except Exception as e:
+        results['openai'] = {"status": "FAIL", "error": str(e)}
+    
+    # Test ElevenLabs
+    try:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
+        headers = {"xi-api-key": ELEVENLABS_API_KEY}
+        payload = {"text": "Test", "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}}
+        
+        async with ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=10) as response:
+                if response.status == 200:
+                    audio_data = await response.read()
+                    results['elevenlabs'] = {"status": "PASS", "audio_size": len(audio_data)}
+                else:
+                    error = await response.text()
+                    results['elevenlabs'] = {"status": "FAIL", "error": f"HTTP {response.status}"}
+    except Exception as e:
+        results['elevenlabs'] = {"status": "FAIL", "error": str(e)}
+    
+    return web.json_response(results)
+
 if __name__ == '__main__':
     log.info("🚀 Starting Sara Streaming Server on port %d", PORT)
     log.info("✅ Media streaming: ACTIVE")
-    log.info("🎙️ Speech recognition: READY (low latency)")
-    log.info("🤖 AI conversation: ENABLED")
-    log.info("🔊 TTS: ElevenLabs" if os.environ.get("ELEVENLABS_API_KEY") else "🔊 TTS: Fallback tones")
+    log.info("🎙️ Speech recognition: READY")
+    log.info("🤖 AI conversation: ENABLED (gpt-5-mini)")
+    log.info("🔊 TTS: ElevenLabs" if ELEVENLABS_API_KEY else "🔊 TTS: Fallback tones")
     web.run_app(app, host='0.0.0.0', port=PORT)
