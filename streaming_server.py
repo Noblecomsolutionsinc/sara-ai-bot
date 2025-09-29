@@ -348,7 +348,7 @@ routes = web.RouteTableDef()
 async def handle_health(request):
     return web.json_response({"status": "ok", "time": datetime.utcnow().isoformat()})
 
-@r@routes.get("/ws")
+@routes.get("/ws")
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
