@@ -27,7 +27,7 @@ log = logging.getLogger("sara-streaming-realtime")
 # --- Config & env ---
 REQUIRED = [
     "OPENAI_API_KEY",
-    "ELEVENLABS_API_KEY",
+    "ELEVENLABS_API_KEY", 
     "ELEVENLABS_VOICE_ID",
     "PUBLIC_STREAMING_URL"
 ]
@@ -63,7 +63,7 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 # --- Persona JSONs load ---
 PERSONA_FILES = [
     "Sara_Opening.json",
-    "Sara_Objections.json",
+    "Sara_Objections.json", 
     "Sara_KnowledgeBase.json",
     "Sara_CallFlow.json",
     "Sara_Playbook.json",
@@ -87,15 +87,46 @@ else:
     SYSTEM_PROMPT = sp if isinstance(sp, str) else json.dumps(sp, ensure_ascii=False)
 log.info("SYSTEM_PROMPT length: %d", len(SYSTEM_PROMPT))
 
-# --- ffmpeg check ---
+# --- Enhanced ffmpeg check ---
 def ensure_ffmpeg():
-    if shutil.which("ffmpeg") is None:
-        log.error("ffmpeg not found on PATH. Install ffmpeg.")
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        log.error("❌ ffmpeg not found on PATH. Install ffmpeg.")
         raise SystemExit("ffmpeg required")
+    
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-    except Exception:
-        log.error("ffmpeg present but failed to run - check installation")
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, check=True)
+        log.info("✅ ffmpeg found: %s", result.stdout.split('\n')[0].split('version')[-1].strip())
+        
+        # Test basic conversion capability
+        test_audio = b'\x00' * 32000  # 2 seconds of silence at 8kHz
+        test_raw = TMP_DIR / "test_ffmpeg.s16le"
+        test_wav = TMP_DIR / "test_ffmpeg.wav"
+        
+        test_raw.write_bytes(test_audio)
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "s16le", "-ar", "8000", "-ac", "1", 
+            "-i", str(test_raw),
+            "-ar", "16000", "-ac", "1",
+            str(test_wav)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        
+        if test_wav.exists():
+            test_wav.unlink()
+            test_raw.unlink()
+            log.info("✅ ffmpeg conversion test passed")
+        else:
+            log.error("❌ ffmpeg conversion test failed")
+            raise SystemExit("ffmpeg conversion failed")
+            
+    except subprocess.CalledProcessError as e:
+        log.error("❌ ffmpeg present but failed to run: %s", e.stderr[:500])
+        raise SystemExit("ffmpeg required")
+    except Exception as e:
+        log.error("❌ ffmpeg test error: %s", str(e))
         raise SystemExit("ffmpeg required")
 
 # Convert raw s16le -> wav (16k) using ffmpeg (blocking; run in executor)
@@ -112,7 +143,7 @@ def raw_bytes_to_wav(raw_path: str, wav_path: str, sample_rate: int = 8000):
         raise RuntimeError(f"ffmpeg conversion failed: {proc.stderr.decode(errors='ignore')[:2000]}")
     return wav_path
 
-# Convert mp3 -> s16le @ out_sample_rate for Twilio playback
+# Convert mp3 -> s16le @ out_sample_rate for Twilio playback  
 def mp3_to_twilio_raw(mp3_path: str, out_raw_path: str, out_sample_rate: int = 8000):
     cmd = [
         "ffmpeg", "-y",
