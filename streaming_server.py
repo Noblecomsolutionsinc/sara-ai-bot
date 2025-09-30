@@ -14,7 +14,7 @@ import json
 import time
 import base64
 import logging
-import asyncio  # ←←← CRITICAL MISSING IMPORT ←←←
+import asyncio
 import pathlib
 import subprocess
 import tempfile
@@ -38,10 +38,9 @@ log = logging.getLogger("sara-streaming")
 SILENCE_TIMEOUT = 1.0            # seconds of silence -> flush small buffer
 MIN_BYTES_TO_PROCESS = 8000      # roughly 1s of mu-law @8k (1 byte/sample)
 TTS_CHUNK_MS = 250               # outbound chunk size in ms
-PRE_SILENCE_MS = 80              # pre-roll silence in ms to help Twilio buffer
+PRE_SILENCE_MS = 200             # INCREASED pre-roll silence to help Twilio buffer
 MAX_AI_HISTORY = 6
 TTS_TIMEOUT = 30                 # seconds for TTS HTTP call
-MARK_WAIT_TIMEOUT = 10.0         # seconds to wait for Twilio 'mark' ack
 
 # -------------------- Per-connection state --------------------
 class ConnState:
@@ -56,7 +55,6 @@ class ConnState:
         self.processing = False
         self.chunk_counter = 0
         self.conversation_history = []      # list of {"role":..., "content":...}
-        self.mark_waiters = {}              # mark_name -> Future
 
 CONNS: dict[str, ConnState] = {}
 
@@ -128,16 +126,26 @@ async def generate_with_gpt(history: list, user_text: str) -> str:
         return "I heard you. (Enable OpenAI key for full responses.)"
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    
+    # Load Sara's persona from JSON files
+    system_prompt = "You are Sara Hayes, a warm and professional growth consultant. Keep responses conversational and under 20 words."
+    try:
+        with open('data/Sara_SystemPrompt_Production.json', 'r') as f:
+            persona_data = json.load(f)
+            system_prompt = f"You are {persona_data.get('sara_identity', {}).get('name', 'Sara Hayes')}, {persona_data.get('sara_identity', {}).get('role', 'a professional consultant')}. {persona_data.get('sara_identity', {}).get('core_directive', 'Be helpful and professional.')}"
+    except Exception as e:
+        log.warning("Could not load persona file: %s", e)
+    
     messages = [
-        {"role": "system", "content": "You are Sara Hayes, a warm and concise phone assistant. Replies should be 1-2 sentences."}
+        {"role": "system", "content": system_prompt}
     ]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     payload = {
-        "model": "gpt-4o-mini",  # ←←← FIXED MODEL NAME ←←←
+        "model": "gpt-4o-mini",
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 150  # ←←← FIXED PARAMETER NAME ←←←
+        "max_tokens": 150
     }
     try:
         async with ClientSession() as sess:
@@ -244,9 +252,6 @@ class TwilioMediaHandler:
                         mark = data.get("mark", {})
                         name = mark.get("name")
                         log.info("🔖 Received mark from Twilio: %s", name)
-                        fut = state.mark_waiters.pop(name, None)
-                        if fut and not fut.done():
-                            fut.set_result(True)
                     elif ev == "stop":
                         log.info("⏹️ Stop event received")
                         break
@@ -355,34 +360,29 @@ class TwilioMediaHandler:
         if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
             try:
                 tts_bytes = await synthesize_with_elevenlabs(text)
+                log.info("✅ ElevenLabs TTS successful, bytes: %d", len(tts_bytes) if tts_bytes else 0)
             except Exception as e:
                 log.exception("ElevenLabs TTS call error: %s", e)
                 tts_bytes = None
 
         if not tts_bytes:
             log.info("🔧 Generating fallback tone for TTS")
-            tts_bytes = ffmpeg_generate_tone_wav(600, 700)
+            tts_bytes = ffmpeg_generate_tone_wav(600, 2000)  # Longer tone for testing
             input_hint = "wav"
 
         loop = asyncio.get_event_loop()
         try:
             mulaw_bytes = await loop.run_in_executor(None, ffmpeg_any_to_mulaw, tts_bytes, input_hint, 8000)
+            log.info("✅ Converted to mu-law, bytes: %d", len(mulaw_bytes))
         except Exception as e:
             log.exception("Failed to convert TTS to mu-law: %s", e)
             return
 
-        mark_name = await self._stream_mulaw_to_twilio(state, mulaw_bytes, chunk_ms=TTS_CHUNK_MS, pre_silence_ms=PRE_SILENCE_MS)
-        if mark_name:
-            fut = asyncio.get_event_loop().create_future()
-            state.mark_waiters[mark_name] = fut
-            try:
-                await asyncio.wait_for(fut, timeout=MARK_WAIT_TIMEOUT)
-                log.info("Playback confirmed by Twilio (mark=%s)", mark_name)
-            except asyncio.TimeoutError:
-                log.warning("Timed out waiting for Twilio mark: %s", mark_name)
-                state.mark_waiters.pop(mark_name, None)
+        # Stream audio without waiting for marks
+        await self._stream_mulaw_to_twilio(state, mulaw_bytes, chunk_ms=TTS_CHUNK_MS, pre_silence_ms=PRE_SILENCE_MS)
+        log.info("✅ Audio streaming completed")
 
-    async def _stream_mulaw_to_twilio(self, state: ConnState, mulaw_bytes: bytes, chunk_ms: int = 250, pre_silence_ms: int = 80) -> Optional[str]:
+    async def _stream_mulaw_to_twilio(self, state: ConnState, mulaw_bytes: bytes, chunk_ms: int = 250, pre_silence_ms: int = 200) -> Optional[str]:
         if not state.stream_sid:
             log.error("No stream sid; cannot send audio")
             return None
@@ -390,9 +390,13 @@ class TwilioMediaHandler:
         if pre_silence_ms and pre_silence_ms > 0:
             silence_samples = int(8000 * pre_silence_ms / 1000)
             mulaw_bytes = (b'\xFF' * silence_samples) + mulaw_bytes
+            log.info("✅ Added %dms of pre-silence", pre_silence_ms)
 
         chunk_size = max(1, int(8000 * chunk_ms / 1000))
         mark_name = f"tts-{int(time.time()*1000)}-{os.urandom(3).hex()}"
+
+        total_chunks = len(mulaw_bytes) // chunk_size
+        log.info("📦 Streaming %d chunks of %d bytes each", total_chunks, chunk_size)
 
         for i in range(0, len(mulaw_bytes), chunk_size):
             chunk = mulaw_bytes[i:i + chunk_size]
@@ -402,7 +406,7 @@ class TwilioMediaHandler:
                 await state.ws.send_str(msg)
                 if i == 0:
                     prefix = base64.b64encode(chunk[:6]).decode("ascii")
-                    log.info("Outbound chunk[0] size=%d b64_prefix=%s", len(chunk), prefix)
+                    log.info("🎵 Outbound chunk[0] size=%d b64_prefix=%s", len(chunk), prefix)
             except Exception as e:
                 log.exception("❌ Failed to send media chunk to Twilio: %s", e)
                 return None
@@ -410,7 +414,7 @@ class TwilioMediaHandler:
 
         try:
             await state.ws.send_str(twilio_mark_msg(state.stream_sid, mark_name))
-            log.info("Sent mark %s for stream %s", mark_name, state.stream_sid)
+            log.info("✅ Sent mark %s for stream %s", mark_name, state.stream_sid)
         except Exception as e:
             log.exception("Failed to send mark to Twilio: %s", e)
             return None
