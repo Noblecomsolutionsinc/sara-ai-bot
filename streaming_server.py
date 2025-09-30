@@ -12,7 +12,7 @@ import asyncio
 import pathlib
 import subprocess
 import tempfile
-import shutil  # ←←← CRITICAL: This import was missing ←←←
+import shutil
 from typing import Optional
 from urllib.parse import parse_qs
 
@@ -129,24 +129,46 @@ async def generate_with_gpt(history: list, user_text: str, business_name: str, b
             persona_data = json.load(f)
             base_prompt = f"""You are {persona_data.get('sara_identity', {}).get('name', 'Sara Hayes')}, {persona_data.get('sara_identity', {}).get('role', 'a Senior Growth Consultant at Noblecom Solutions')}. 
             
-You are calling {business_name}, which appears to be a {business_type}. 
+You are making an OUTBOUND COLD CALL to {business_name}, which appears to be a {business_type}. 
 
 Core Mission: {persona_data.get('sara_identity', {}).get('core_directive', 'Help businesses stop losing clients and secure meetings to review free audits.')}
 
 Communication Style: {persona_data.get('sara_identity', {}).get('communication_style', {}).get('pace', 'Moderate with deliberate pauses')}
+
+CRITICAL RULES FOR OUTBOUND COLD CALLING:
+- You are making the FIRST CONTACT - they don't know you
+- Be direct, confident, and get to the point quickly
+- Use pattern-interrupt openers to grab attention
+- Focus on their pain points and lost revenue
+- Always guide toward booking a meeting
+- Never sound like customer service - you're a growth consultant
+- Use industry-specific language and numbers
+- Be persistent but professional
+- Handle objections with ARC framework (Acknowledge, Reframe, Close)
 """
     except Exception as e:
         base_prompt = f"""You are Sara Hayes, a Senior Growth Consultant at Noblecom Solutions. 
         
-You are calling {business_name}, which appears to be a {business_type}. 
+You are making an OUTBOUND COLD CALL to {business_name}, which appears to be a {business_type}. 
 
 Your mission is to help businesses stop losing clients and secure a meeting to review a free audit.
+
+CRITICAL OUTBOUND COLD CALLING RULES:
+- This is a COLD CALL - they don't know you
+- Be direct and get to the point in under 10 seconds
+- Use pattern-interrupt openers
+- Focus on their specific pain points and lost revenue
+- Always guide toward booking a 15-minute audit review
+- Never sound like customer service
+- Use industry-specific numbers and examples
+- Handle objections professionally but persistently
+- Key phrases: "I noticed...", "Many {business_type}s are losing...", "Would 15 minutes tomorrow make sense?"
 
 Key Rules:
 - NEVER reveal you are AI - you are Sara, a human consultant
 - Use natural conversational language with light fillers ("uh", "you know", "I see")
 - Keep responses concise (15-25 words)
-- Be warm, professional, and empathetic
+- Be warm, professional, and authoritative
 - Focus on identifying client leakage and offering value
 - Always guide toward a concrete next step (meeting, callback, or information)"""
 
@@ -220,14 +242,22 @@ class TwilioMediaHandler:
         ws_id = f"conn_{int(time.time()*1000)}"
         state = ConnState(ws)
         
-        # Parse business context from URL parameters
+        # Parse business context from URL parameters - FIXED VERSION
         try:
             query_params = parse_qs(request.rel_url.query_string)
             state.business_name = query_params.get('business_name', ['the business'])[0]
             state.business_type = query_params.get('business_type', ['general'])[0]
+            
+            # URL decode the parameters
+            import urllib.parse
+            state.business_name = urllib.parse.unquote(state.business_name)
+            state.business_type = urllib.parse.unquote(state.business_type)
+            
             log.info(f"🏢 Business Context - Name: {state.business_name}, Type: {state.business_type}")
         except Exception as e:
             log.warning("Could not parse business context: %s", e)
+            state.business_name = "the business"
+            state.business_type = "general"
         
         CONNS[ws_id] = state
         log.info("🎉 WebSocket connected: %s", ws_id)
@@ -381,21 +411,51 @@ class TwilioMediaHandler:
                 await self._respond_with_tts(ws_id, reply)
             else:
                 if not any(m.get("role") == "assistant" for m in state.conversation_history[-1:]):
-                    # Use business-specific greeting
-                    greeting = f"Hello, this is Sara Hayes from Noblecom Solutions. I'm calling {state.business_name} about helping businesses like yours stop losing potential clients. How are you today?"
+                    # Use business-specific COLD CALL opener
+                    greeting = self._get_cold_call_opener(state.business_name, state.business_type)
                     await self._respond_with_tts(ws_id, greeting)
         except Exception as e:
             log.exception("❌ Error processing audio buffer: %s", e)
         finally:
             state.processing = False
 
+    def _get_cold_call_opener(self, business_name: str, business_type: str) -> str:
+        """Generate industry-specific cold call openers"""
+        openers = {
+            "dermatology clinic": [
+                f"Hi, this is Sara Hayes from Noblecom. I noticed {business_name} might be missing 20-30 cosmetic patients monthly to competitors with stronger online presence. Have you measured your patient acquisition gaps recently?",
+                f"Hey, Sara Hayes here. With the current surge in cosmetic demand, many dermatology practices are losing $30-50K monthly in missed revenue. I've got some insights specific to your clinic - got a quick minute?"
+            ],
+            "law firm": [
+                f"Hi, this is Sara Hayes from Noblecom. I specialize in helping law firms recover the 7-9 potential clients they lose each week to competitors. Have you tracked your intake conversion rates lately?",
+                f"Hey, Sara Hayes calling. I noticed {business_name} might be missing significant case revenue due to online visibility gaps. Many firms we work with recover $10-20K monthly - worth a quick look?"
+            ],
+            "dental practice": [
+                f"Hi, this is Sara Hayes from Noblecom. For aesthetic dentists, online presence is everything. I'm seeing many practices lose 15-25 patients monthly because their digital smile doesn't match their work. Sound familiar?",
+                f"Hey, Sara Hayes here. {business_name} might be missing $3-5K per patient in cosmetic dentistry revenue due to visibility gaps. Got 60 seconds to discuss what we're seeing in your market?"
+            ],
+            "medical practice": [
+                f"Hi, this is Sara Hayes from Noblecom. Many medical practices are missing patients due to online scheduling barriers and visibility issues. Have you reviewed your new patient acquisition numbers this quarter?",
+                f"Hey, Sara Hayes calling. I help medical practices like {business_name} fill appointment gaps and attract the right patients. The numbers we're seeing might surprise you - quick minute to discuss?"
+            ]
+        }
+        
+        # Get opener for specific business type or use general
+        specific_openers = openers.get(business_type.lower(), [])
+        if specific_openers:
+            import random
+            return random.choice(specific_openers)
+        else:
+            # General cold call opener
+            return f"Hi, this is Sara Hayes from Noblecom Solutions. I help businesses like {business_name} identify and stop revenue leakage from client acquisition gaps. Many {business_type}s are losing significant revenue without realizing it - worth a quick 2-minute discussion?"
+
     async def send_immediate_greeting(self, ws_id: str):
         state = CONNS.get(ws_id)
         if not state:
             return
             
-        # Business-specific greeting
-        greeting = f"Hello, this is Sara Hayes from Noblecom Solutions. I'm calling {state.business_name} about helping {state.business_type}s stop losing potential clients. How can I help you today?"
+        # Use cold call opener instead of customer service greeting
+        greeting = self._get_cold_call_opener(state.business_name, state.business_type)
         await self._respond_with_tts(ws_id, greeting)
 
     async def _respond_with_tts(self, ws_id: str, text: str):
