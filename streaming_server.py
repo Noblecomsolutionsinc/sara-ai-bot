@@ -12,6 +12,7 @@ import asyncio
 import pathlib
 import subprocess
 import tempfile
+import shutil  # ←←← CRITICAL: This import was missing ←←←
 from typing import Optional
 from urllib.parse import parse_qs
 
