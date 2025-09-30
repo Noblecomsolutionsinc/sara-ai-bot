@@ -58,7 +58,7 @@ def health():
 
 @app.route("/outbound", methods=["POST"])
 def outbound():
-    """Twilio webhook for outbound calls - RETURNS TWIML WITH STREAM ONLY"""
+    """Twilio webhook for outbound calls - PROPER TWIML WITH SAY+STREAM+PAUSE"""
     try:
         call_sid = request.form.get("CallSid", "unknown")
         from_number = request.form.get("From", "unknown")
@@ -71,15 +71,17 @@ def outbound():
         log.error("Error parsing Twilio request: %s", e)
         call_sid = "error"
 
-    # ✅ CRITICAL FIX: Remove <Say> and <Pause> - ONLY stream
+    # ✅ CRITICAL FIX: Proper TwiML with Say + Stream + Pause
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Say voice="alice">Connecting you to Sara Hayes.</Say>
     <Start>
         <Stream url="{PUBLIC_STREAMING_URL}"/>
     </Start>
+    <Pause length="60"/>
 </Response>"""
     
-    log.info("📋 Returning TwiML with Stream URL ONLY: %s", PUBLIC_STREAMING_URL)
+    log.info("📋 Returning TwiML with Say+Stream+Pause: %s", PUBLIC_STREAMING_URL)
     return Response(twiml, mimetype="text/xml")
 
 @app.route("/inbound", methods=["POST"])
@@ -100,9 +102,11 @@ def inbound():
     # Same fix for inbound calls
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Say voice="alice">Connecting you to Sara Hayes.</Say>
     <Start>
         <Stream url="{PUBLIC_STREAMING_URL}"/>
     </Start>
+    <Pause length="60"/>
 </Response>"""
     
     return Response(twiml, mimetype="text/xml")
