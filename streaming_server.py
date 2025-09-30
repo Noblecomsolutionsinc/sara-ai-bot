@@ -1,13 +1,7 @@
 # file: streaming_server.py
 """
 Production-ready Twilio Media Streams server (aiohttp).
-Drop into your project, restart, and test calls.
-Requirements:
- - ffmpeg on PATH
- - Python 3.10+
- - pip install aiohttp
-Env vars:
- - OPENAI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID (optional)
+Sara AI Voice Bot - Full Production Version
 """
 import os
 import json
@@ -19,6 +13,7 @@ import pathlib
 import subprocess
 import tempfile
 from typing import Optional
+from urllib.parse import parse_qs
 
 from aiohttp import web, WSMsgType, ClientSession, FormData
 
@@ -38,7 +33,7 @@ log = logging.getLogger("sara-streaming")
 SILENCE_TIMEOUT = 1.0            # seconds of silence -> flush small buffer
 MIN_BYTES_TO_PROCESS = 8000      # roughly 1s of mu-law @8k (1 byte/sample)
 TTS_CHUNK_MS = 250               # outbound chunk size in ms
-PRE_SILENCE_MS = 200             # INCREASED pre-roll silence to help Twilio buffer
+PRE_SILENCE_MS = 200             # pre-roll silence in ms to help Twilio buffer
 MAX_AI_HISTORY = 6
 TTS_TIMEOUT = 30                 # seconds for TTS HTTP call
 
@@ -55,6 +50,8 @@ class ConnState:
         self.processing = False
         self.chunk_counter = 0
         self.conversation_history = []      # list of {"role":..., "content":...}
+        self.business_name: str = "the business"
+        self.business_type: str = "general"
 
 CONNS: dict[str, ConnState] = {}
 
@@ -95,7 +92,7 @@ def twilio_media_msg(stream_sid: str, b64_payload: str) -> str:
 def twilio_mark_msg(stream_sid: str, name: str) -> str:
     return json.dumps({"event": "mark", "streamSid": stream_sid, "mark": {"name": name}})
 
-# -------------------- OpenAI / ElevenLabs stubs (replace as needed) --------------------
+# -------------------- OpenAI / ElevenLabs --------------------
 async def transcribe_with_whisper(wav_bytes: bytes) -> Optional[str]:
     if not OPENAI_API_KEY:
         log.warning("OpenAI key missing; returning mock transcription")
@@ -120,39 +117,67 @@ async def transcribe_with_whisper(wav_bytes: bytes) -> Optional[str]:
         log.exception("Whisper request error: %s", e)
         return None
 
-async def generate_with_gpt(history: list, user_text: str) -> str:
+async def generate_with_gpt(history: list, user_text: str, business_name: str, business_type: str) -> str:
     if not OPENAI_API_KEY:
         await asyncio.sleep(0.05)
         return "I heard you. (Enable OpenAI key for full responses.)"
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     
-    # Load Sara's persona from JSON files
-    system_prompt = "You are Sara Hayes, a warm and professional growth consultant. Keep responses conversational and under 20 words."
+    # Load Sara's persona from JSON files if available
     try:
         with open('data/Sara_SystemPrompt_Production.json', 'r') as f:
             persona_data = json.load(f)
-            system_prompt = f"You are {persona_data.get('sara_identity', {}).get('name', 'Sara Hayes')}, {persona_data.get('sara_identity', {}).get('role', 'a professional consultant')}. {persona_data.get('sara_identity', {}).get('core_directive', 'Be helpful and professional.')}"
+            base_prompt = f"""You are {persona_data.get('sara_identity', {}).get('name', 'Sara Hayes')}, {persona_data.get('sara_identity', {}).get('role', 'a Senior Growth Consultant at Noblecom Solutions')}. 
+            
+You are calling {business_name}, which appears to be a {business_type}. 
+
+Core Mission: {persona_data.get('sara_identity', {}).get('core_directive', 'Help businesses stop losing clients and secure meetings to review free audits.')}
+
+Communication Style: {persona_data.get('sara_identity', {}).get('communication_style', {}).get('pace', 'Moderate with deliberate pauses')}
+"""
     except Exception as e:
-        log.warning("Could not load persona file: %s", e)
+        base_prompt = f"""You are Sara Hayes, a Senior Growth Consultant at Noblecom Solutions. 
+        
+You are calling {business_name}, which appears to be a {business_type}. 
+
+Your mission is to help businesses stop losing clients and secure a meeting to review a free audit.
+
+Key Rules:
+- NEVER reveal you are AI - you are Sara, a human consultant
+- Use natural conversational language with light fillers ("uh", "you know", "I see")
+- Keep responses concise (15-25 words)
+- Be warm, professional, and empathetic
+- Focus on identifying client leakage and offering value
+- Always guide toward a concrete next step (meeting, callback, or information)"""
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     
     messages = [
-        {"role": "system", "content": system_prompt}
+        {"role": "system", "content": base_prompt}
     ]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
+    
     payload = {
         "model": "gpt-4o-mini",
         "messages": messages,
         "temperature": 0.7,
         "max_tokens": 150
     }
+    
     try:
         async with ClientSession() as sess:
             async with sess.post(url, headers=headers, json=payload, timeout=30) as resp:
                 if resp.status == 200:
                     j = await resp.json()
-                    return j["choices"][0]["message"]["content"].strip()
+                    response_text = j["choices"][0]["message"]["content"].strip()
+                    
+                    # Log the intelligent response context
+                    log.info(f"🎯 Business Context - {business_name} ({business_type})")
+                    log.info(f"💬 User: {user_text}")
+                    log.info(f"🤖 Sara: {response_text}")
+                    
+                    return response_text
                 else:
                     txt = await resp.text()
                     log.error("GPT request failed: %s", txt[:400])
@@ -193,6 +218,16 @@ class TwilioMediaHandler:
 
         ws_id = f"conn_{int(time.time()*1000)}"
         state = ConnState(ws)
+        
+        # Parse business context from URL parameters
+        try:
+            query_params = parse_qs(request.rel_url.query_string)
+            state.business_name = query_params.get('business_name', ['the business'])[0]
+            state.business_type = query_params.get('business_type', ['general'])[0]
+            log.info(f"🏢 Business Context - Name: {state.business_name}, Type: {state.business_type}")
+        except Exception as e:
+            log.warning("Could not parse business context: %s", e)
+        
         CONNS[ws_id] = state
         log.info("🎉 WebSocket connected: %s", ws_id)
 
@@ -243,6 +278,7 @@ class TwilioMediaHandler:
 
                         log.info("🎬 Stream started - stream_sid: %s mediaFormat: %s sampleRate: %s",
                                  state.stream_sid, state.media_format, state.sample_rate)
+                        log.info("🏢 Calling: %s (%s)", state.business_name, state.business_type)
 
                         # start greeting without blocking
                         asyncio.create_task(self.send_immediate_greeting(ws_id))
@@ -331,7 +367,12 @@ class TwilioMediaHandler:
                 log.info("No speech detected or transcript too short")
 
             if transcript and len(transcript.strip()) >= 3:
-                reply = await generate_with_gpt(state.conversation_history, transcript)
+                reply = await generate_with_gpt(
+                    state.conversation_history, 
+                    transcript, 
+                    state.business_name, 
+                    state.business_type
+                )
                 state.conversation_history.append({"role": "user", "content": transcript})
                 state.conversation_history.append({"role": "assistant", "content": reply})
                 state.conversation_history = state.conversation_history[-MAX_AI_HISTORY:]
@@ -339,15 +380,22 @@ class TwilioMediaHandler:
                 await self._respond_with_tts(ws_id, reply)
             else:
                 if not any(m.get("role") == "assistant" for m in state.conversation_history[-1:]):
-                    prompt = "I'm listening. Please tell me how I can help you today."
-                    await self._respond_with_tts(ws_id, prompt)
+                    # Use business-specific greeting
+                    greeting = f"Hello, this is Sara Hayes from Noblecom Solutions. I'm calling {state.business_name} about helping businesses like yours stop losing potential clients. How are you today?"
+                    await self._respond_with_tts(ws_id, greeting)
         except Exception as e:
             log.exception("❌ Error processing audio buffer: %s", e)
         finally:
             state.processing = False
 
     async def send_immediate_greeting(self, ws_id: str):
-        await self._respond_with_tts(ws_id, "Hello! I'm Sara Hayes. How can I help you today?")
+        state = CONNS.get(ws_id)
+        if not state:
+            return
+            
+        # Business-specific greeting
+        greeting = f"Hello, this is Sara Hayes from Noblecom Solutions. I'm calling {state.business_name} about helping {state.business_type}s stop losing potential clients. How can I help you today?"
+        await self._respond_with_tts(ws_id, greeting)
 
     async def _respond_with_tts(self, ws_id: str, text: str):
         state = CONNS.get(ws_id)
@@ -446,4 +494,10 @@ app.router.add_get('/health', lambda r: web.json_response({"status": "ok", "acti
 
 if __name__ == '__main__':
     log.info("🚀 Starting Sara Streaming Server on port %s", PORT)
+    log.info("🔧 Configuration:")
+    log.info("   - OpenAI API: %s", "✅ Configured" if OPENAI_API_KEY else "❌ Missing")
+    log.info("   - ElevenLabs API: %s", "✅ Configured" if ELEVENLABS_API_KEY else "❌ Missing")
+    log.info("   - ElevenLabs Voice: %s", ELEVENLABS_VOICE_ID or "❌ Missing")
+    log.info("   - FFmpeg: %s", "✅ Available" if shutil.which("ffmpeg") else "❌ Missing")
+    
     web.run_app(app, host='0.0.0.0', port=PORT)
