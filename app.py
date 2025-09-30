@@ -1,459 +1,385 @@
-# file: streaming_server.py
-"""
-Production-ready Twilio Media Streams server (aiohttp).
-Sara AI Voice Bot - Full Production Version
-"""
+# File: app.py
 import os
-import json
-import time
-import base64
+import csv
 import logging
-import asyncio
-import pathlib
-import subprocess
-import tempfile
-import shutil
-from typing import Optional
-from urllib.parse import parse_qs
+import time
+import re
+from flask import Flask, Response, jsonify, request
+from twilio.rest import Client
 
-from aiohttp import web, WSMsgType, ClientSession, FormData
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("sara-app")
 
-# -------------------- Config & logging --------------------
-PORT = int(os.environ.get("PORT", 5001))
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID")
+# --- Required env vars ---
+REQUIRED = [
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN", 
+    "TWILIO_PHONE_NUMBER",
+    "SERVER_URL",
+    "PUBLIC_STREAMING_URL"
+]
 
-TMP_DIR = pathlib.Path("tmp")
-TMP_DIR.mkdir(exist_ok=True)
+missing = [v for v in REQUIRED if not os.environ.get(v)]
+if missing:
+    log.error("Missing required env vars: %s", missing)
+    log.warning("Some environment variables missing, but continuing...")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("sara-streaming")
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER")
+SERVER_URL = os.environ.get("SERVER_URL", "https://sara-ai-bot.onrender.com").rstrip("/")
+PUBLIC_STREAMING_URL = os.environ.get("PUBLIC_STREAMING_URL", "https://sara-ai-streaming.onrender.com").rstrip("/")
 
-# -------------------- Tunables --------------------
-SILENCE_TIMEOUT = 1.0            # seconds of silence -> flush small buffer
-MIN_BYTES_TO_PROCESS = 8000      # roughly 1s of mu-law @8k (1 byte/sample)
-TTS_CHUNK_MS = 250               # outbound chunk size in ms
-PRE_SILENCE_MS = 200             # pre-roll silence in ms to help Twilio buffer
-MAX_AI_HISTORY = 6
-TTS_TIMEOUT = 30                 # seconds for TTS HTTP call
+# Ensure WebSocket URL uses wss://
+if PUBLIC_STREAMING_URL.startswith('http://'):
+    PUBLIC_STREAMING_URL = PUBLIC_STREAMING_URL.replace('http://', 'wss://', 1)
+elif PUBLIC_STREAMING_URL.startswith('https://'):
+    PUBLIC_STREAMING_URL = PUBLIC_STREAMING_URL.replace('https://', 'wss://', 1)
+elif not PUBLIC_STREAMING_URL.startswith('wss://'):
+    PUBLIC_STREAMING_URL = f"wss://{PUBLIC_STREAMING_URL}"
 
-# -------------------- Per-connection state --------------------
-class ConnState:
-    def __init__(self, ws):
-        self.ws = ws
-        self.stream_sid: Optional[str] = None
-        self.call_sid: Optional[str] = None
-        self.sample_rate: int = 8000
-        self.media_format: str = ""         # normalized textual form
-        self.buffer = bytearray()           # incoming raw bytes from Twilio
-        self.last_media_ts = time.time()
-        self.processing = False
-        self.chunk_counter = 0
-        self.conversation_history = []      # list of {"role":..., "content":...}
-        self.business_name: str = "the business"
-        self.business_type: str = "general"
+# Add WebSocket path if not present
+if not PUBLIC_STREAMING_URL.endswith('/ws'):
+    PUBLIC_STREAMING_URL = f"{PUBLIC_STREAMING_URL}/ws"
 
-CONNS: dict[str, ConnState] = {}
+log.info("Using WebSocket URL: %s", PUBLIC_STREAMING_URL)
 
-# -------------------- FFmpeg helpers (blocking) --------------------
-def ffmpeg_to_wav(input_bytes: bytes, input_format_hint: Optional[str], in_rate: int, out_rate: int = 16000) -> bytes:
+client = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+else:
+    log.warning("Twilio client not initialized - missing credentials")
+
+app = Flask(__name__)
+
+def detect_business_type(business_name):
     """
-    Convert raw incoming bytes to WAV PCM16@out_rate for Whisper.
-    input_format_hint: 'mulaw' or 's16le' or None.
+    Intelligently detect business type from company name using keyword analysis
     """
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-    if input_format_hint:
-        cmd += ["-f", input_format_hint]
-    cmd += ["-ar", str(in_rate), "-ac", "1", "-i", "pipe:0", "-ar", str(out_rate), "-ac", "1", "-f", "wav", "pipe:1"]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate(input=input_bytes)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg->wav failed: {err.decode(errors='ignore')}")
-    return out
-
-def ffmpeg_any_to_mulaw(input_bytes: bytes, input_format_hint: Optional[str] = None, out_rate: int = 8000) -> bytes:
-    """
-    Convert arbitrary audio bytes (mp3/wav/pcm) to raw mu-law @ out_rate (no headers).
-    """
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-    if input_format_hint:
-        cmd += ["-f", input_format_hint]
-    cmd += ["-i", "pipe:0", "-ar", str(out_rate), "-ac", "1", "-f", "mulaw", "pipe:1"]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate(input=input_bytes)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg->mulaw failed: {err.decode(errors='ignore')}")
-    return out
-
-# -------------------- Twilio JSON builders --------------------
-def twilio_media_msg(stream_sid: str, b64_payload: str) -> str:
-    return json.dumps({"event": "media", "streamSid": stream_sid, "media": {"payload": b64_payload}})
-
-def twilio_mark_msg(stream_sid: str, name: str) -> str:
-    return json.dumps({"event": "mark", "streamSid": stream_sid, "mark": {"name": name}})
-
-# -------------------- OpenAI / ElevenLabs --------------------
-async def transcribe_with_whisper(wav_bytes: bytes) -> Optional[str]:
-    if not OPENAI_API_KEY:
-        log.warning("OpenAI key missing; returning mock transcription")
-        await asyncio.sleep(0.05)
-        return "This is a test transcription. Configure OPENAI_API_KEY to enable real transcription."
-    url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    data = FormData()
-    data.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
-    data.add_field("model", "whisper-1")
-    try:
-        async with ClientSession() as sess:
-            async with sess.post(url, headers=headers, data=data, timeout=30) as resp:
-                if resp.status == 200:
-                    j = await resp.json()
-                    return j.get("text", "").strip()
-                else:
-                    txt = await resp.text()
-                    log.error("Whisper transcription failed: %s", txt[:400])
-                    return None
-    except Exception as e:
-        log.exception("Whisper request error: %s", e)
-        return None
-
-async def generate_with_gpt(history: list, user_text: str, business_name: str, business_type: str) -> str:
-    if not OPENAI_API_KEY:
-        await asyncio.sleep(0.05)
-        return "I heard you. (Enable OpenAI key for full responses.)"
+    if not business_name:
+        return "general business"
     
-    # Load Sara's persona from JSON files if available
-    try:
-        with open('data/Sara_SystemPrompt_Production.json', 'r') as f:
-            persona_data = json.load(f)
-            base_prompt = f"""You are {persona_data.get('sara_identity', {}).get('name', 'Sara Hayes')}, {persona_data.get('sara_identity', {}).get('role', 'a Senior Growth Consultant at Noblecom Solutions')}. 
-            
-You are calling {business_name}, which appears to be a {business_type}. 
-
-Core Mission: {persona_data.get('sara_identity', {}).get('core_directive', 'Help businesses stop losing clients and secure meetings to review free audits.')}
-
-Communication Style: {persona_data.get('sara_identity', {}).get('communication_style', {}).get('pace', 'Moderate with deliberate pauses')}
-"""
-    except Exception as e:
-        base_prompt = f"""You are Sara Hayes, a Senior Growth Consultant at Noblecom Solutions. 
-        
-You are calling {business_name}, which appears to be a {business_type}. 
-
-Your mission is to help businesses stop losing clients and secure a meeting to review a free audit.
-
-Key Rules:
-- NEVER reveal you are AI - you are Sara, a human consultant
-- Use natural conversational language with light fillers ("uh", "you know", "I see")
-- Keep responses concise (15-25 words)
-- Be warm, professional, and empathetic
-- Focus on identifying client leakage and offering value
-- Always guide toward a concrete next step (meeting, callback, or information)"""
-
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    name_lower = business_name.lower()
     
-    messages = [
-        {"role": "system", "content": base_prompt}
-    ]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_text})
+    # Legal industry
+    legal_keywords = ['law', 'legal', 'attorney', 'lawyer', 'firm', 'advocate', 'counsel', 'barrister', 'litigation', 'justice']
+    if any(keyword in name_lower for keyword in legal_keywords):
+        return "law firm"
     
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 150
+    # Medical - Dermatology
+    derm_keywords = ['dermatology', 'dermatologist', 'derm', 'skin', 'cosmetic', 'aesthetic', 'laser', 'botox', 'filler', 'rejuvenation']
+    if any(keyword in name_lower for keyword in derm_keywords):
+        return "dermatology clinic"
+    
+    # Medical - Dental
+    dental_keywords = ['dental', 'dentist', 'teeth', 'smile', 'orthodontist', 'oral', 'implant', 'braces', 'invisalign']
+    if any(keyword in name_lower for keyword in dental_keywords):
+        return "dental practice"
+    
+    # Medical - General
+    medical_keywords = ['medical', 'clinic', 'hospital', 'health', 'wellness', 'doctor', 'physician', 'care', 'surgery']
+    if any(keyword in name_lower for keyword in medical_keywords):
+        return "medical practice"
+    
+    # Accounting/Financial
+    accounting_keywords = ['accounting', 'accountant', 'tax', 'cpa', 'financial', 'bookkeeping', 'audit', 'consulting', 'advisory']
+    if any(keyword in name_lower for keyword in accounting_keywords):
+        return "accounting firm"
+    
+    # Real Estate
+    real_estate_keywords = ['real estate', 'realtor', 'property', 'housing', 'estate', 'broker', 'realty']
+    if any(keyword in name_lower for keyword in real_estate_keywords):
+        return "real estate agency"
+    
+    # Insurance
+    insurance_keywords = ['insurance', 'insurer', 'coverage', 'policy', 'assurance', 'underwriter']
+    if any(keyword in name_lower for keyword in insurance_keywords):
+        return "insurance agency"
+    
+    # Technology
+    tech_keywords = ['tech', 'software', 'digital', 'it', 'computer', 'system', 'solution', 'development', 'app', 'web']
+    if any(keyword in name_lower for keyword in tech_keywords):
+        return "technology company"
+    
+    # Marketing
+    marketing_keywords = ['marketing', 'media', 'advertising', 'brand', 'creative', 'agency', 'communications', 'pr', 'public relations']
+    if any(keyword in name_lower for keyword in marketing_keywords):
+        return "marketing agency"
+    
+    # Construction
+    construction_keywords = ['construction', 'contractor', 'build', 'renovation', 'remodel', 'contracting', 'builder']
+    if any(keyword in name_lower for keyword in construction_keywords):
+        return "construction company"
+    
+    # Restaurant/Food
+    food_keywords = ['restaurant', 'cafe', 'bistro', 'grill', 'kitchen', 'food', 'eatery', 'dining', 'bar & grill']
+    if any(keyword in name_lower for keyword in food_keywords):
+        return "restaurant"
+    
+    # Retail
+    retail_keywords = ['shop', 'store', 'retail', 'boutique', 'market', 'outlet', 'merchant']
+    if any(keyword in name_lower for keyword in retail_keywords):
+        return "retail store"
+    
+    # If no specific match, use general business classification
+    business_keywords = ['company', 'corp', 'inc', 'llc', 'enterprise', 'ventures', 'group', 'partners', 'associates']
+    if any(keyword in name_lower for keyword in business_keywords):
+        return "professional services"
+    
+    return "local business"
+
+def get_business_context(business_name, detected_type):
+    """
+    Generate intelligent context based on detected business type
+    """
+    context_templates = {
+        "law firm": {
+            "opening": f"I'm calling {business_name} because I specialize in helping law firms stop losing 7-9 potential clients each week to competitors who are simply easier to find online.",
+            "value_prop": "We help recover $10K-$20K monthly in missed case revenue through better online visibility and intake optimization."
+        },
+        "dermatology clinic": {
+            "opening": f"I'm reaching out to {business_name} about the current surge in cosmetic demand. Many dermatology practices miss 20-30 high-value patients monthly due to online visibility gaps.",
+            "value_prop": "We help recapture $30K-$50K in monthly missed revenue from cosmetic patients seeking treatments like Botox and fillers."
+        },
+        "dental practice": {
+            "opening": f"I'm calling {business_name} because for aesthetic dentists, a strong before-and-after presence is everything. Many practices lose 15-25 patients monthly because their online smile isn't as good as their work.",
+            "value_prop": "We help capture $3K-$5K per patient in cosmetic dentistry revenue through better online presentation."
+        },
+        "medical practice": {
+            "opening": f"I'm contacting {business_name} to discuss how medical practices often miss patients due to online visibility issues and scheduling barriers.",
+            "value_prop": "We help medical practices fill appointment gaps and attract the right patients through optimized online presence."
+        },
+        "accounting firm": {
+            "opening": f"I'm calling {business_name} about tax season visibility. Many accounting firms miss dozens of clients because they aren't top-of-mind when tax searches happen in February.",
+            "value_prop": "We ensure you capture peak season demand with clients worth $1K-$2.5K annually through better online positioning."
+        },
+        "real estate agency": {
+            "opening": f"I'm reaching out to {business_name} because in real estate, being found first is everything. Many agencies lose listings to competitors with stronger online presence.",
+            "value_prop": "We help real estate agencies capture more listings and qualified buyers through dominant online visibility."
+        },
+        "insurance agency": {
+            "opening": f"I'm calling {business_name} about the competitive insurance market. Many agencies lose clients to larger carriers with bigger marketing budgets.",
+            "value_prop": "We help independent insurance agencies compete effectively and capture more local clients online."
+        },
+        "technology company": {
+            "opening": f"I'm contacting {business_name} because even tech companies can struggle with client acquisition. Many miss opportunities due to poor online conversion.",
+            "value_prop": "We help technology companies generate more qualified leads and improve their sales pipeline through better online positioning."
+        },
+        "marketing agency": {
+            "opening": f"I'm calling {business_name} with an interesting observation - many marketing agencies are so busy helping clients that they neglect their own online presence.",
+            "value_prop": "We help marketing agencies showcase their expertise and attract higher-value clients through strategic online visibility."
+        },
+        "construction company": {
+            "opening": f"I'm reaching out to {business_name} because in construction, homeowners start their search online. Many contractors lose projects due to poor digital presence.",
+            "value_prop": "We help construction companies win more bids and premium projects through better online credibility and visibility."
+        },
+        "restaurant": {
+            "opening": f"I'm calling {business_name} about the importance of online presence for restaurants. Many establishments lose customers to competitors with better reviews and visibility.",
+            "value_prop": "We help restaurants attract more diners and increase reservations through improved online reputation and visibility."
+        },
+        "retail store": {
+            "opening": f"I'm contacting {business_name} because local retail has changed - customers now research online before visiting. Many stores lose sales due to poor digital presence.",
+            "value_prop": "We help retail stores drive more foot traffic and local sales through better online visibility and customer engagement."
+        },
+        "professional services": {
+            "opening": f"I'm calling {business_name} because I specialize in helping professional service firms stop losing potential clients due to online visibility gaps.",
+            "value_prop": "We identify and plug revenue leakage that's costing you clients every week through simple, proven fixes."
+        },
+        "local business": {
+            "opening": f"I'm reaching out to {business_name} because I help local businesses capture more customers who are actively searching for their services online.",
+            "value_prop": "We help businesses like yours stop losing potential clients to competitors with better online presence and visibility."
+        }
     }
     
+    return context_templates.get(detected_type, context_templates["local business"])
+
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/outbound", methods=["GET", "POST"])
+def outbound():
+    """Twilio webhook for OUTBOUND calls - Sara calls people"""
     try:
-        async with ClientSession() as sess:
-            async with sess.post(url, headers=headers, json=payload, timeout=30) as resp:
-                if resp.status == 200:
-                    j = await resp.json()
-                    response_text = j["choices"][0]["message"]["content"].strip()
-                    
-                    # Log the intelligent response context
-                    log.info(f"🎯 Business Context - {business_name} ({business_type})")
-                    log.info(f"💬 User: {user_text}")
-                    log.info(f"🤖 Sara: {response_text}")
-                    
-                    return response_text
-                else:
-                    txt = await resp.text()
-                    log.error("GPT request failed: %s", txt[:400])
-                    return f"I understand you said: {user_text}. How can I help?"
+        call_sid = request.form.get("CallSid", "unknown")
+        from_number = request.form.get("From", "unknown")
+        to_number = request.form.get("To", "unknown")
+        
+        log.info("📞 OUTBOUND CALL - Sara calling: %s, From: %s, To: %s", 
+                call_sid, from_number, to_number)
+        
     except Exception as e:
-        log.exception("GPT request error: %s", e)
-        return "I'm having trouble thinking right now — can you repeat that?"
+        log.error("Error parsing Twilio request: %s", e)
+        call_sid = "error"
 
-async def synthesize_with_elevenlabs(text: str) -> Optional[bytes]:
-    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-        log.warning("ElevenLabs keys missing; using fallback")
+    # Get business context from URL parameters
+    business_name = request.args.get("business_name", "Unknown Business")
+    business_type = request.args.get("business_type", "general")
+    
+    log.info("🏢 Intelligent Call - Business: %s, Detected Type: %s", business_name, business_type)
+    
+    # Pass context to streaming server via URL parameters
+    stream_url = f"{PUBLIC_STREAMING_URL}?business_name={business_name}&business_type={business_type}"
+    
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Start>
+        <Stream url="{stream_url}"/>
+    </Start>
+    <Say>Please wait while we connect your call.</Say>
+    <Pause length="3"/>
+</Response>"""
+    
+    log.info("📋 Returning intelligent TwiML for: %s", business_name)
+    return Response(twiml, mimetype="text/xml")
+
+def safe_initiate_call(to_number, name="unknown", business_type="general"):
+    """Make Sara call someone with intelligent business context"""
+    if not client:
+        log.error("Twilio client not initialized - cannot make call")
         return None
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
-    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
-    payload = {"text": text, "voice_settings": {"stability": 0.6, "similarity_boost": 0.7}}
+        
+    # Detect business type from name
+    detected_type = detect_business_type(name)
+    context = get_business_context(name, detected_type)
+    
+    log.info("🎯 SARA INITIATING INTELLIGENT CALL")
+    log.info("   Business: %s", name)
+    log.info("   Detected Type: %s", detected_type)
+    log.info("   Opening: %s", context["opening"])
+    log.info("   Value Prop: %s", context["value_prop"])
+    
     try:
-        async with ClientSession() as sess:
-            async with sess.post(url, headers=headers, json=payload, timeout=TTS_TIMEOUT) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                else:
-                    txt = await resp.text()
-                    log.error("ElevenLabs TTS failed: %s", txt[:400])
-                    return None
+        # Pass business context to the call
+        call = client.calls.create(
+            to=to_number,
+            from_=TWILIO_PHONE_NUMBER,
+            url=f"{SERVER_URL}/outbound?business_name={name}&business_type={detected_type}",
+            method="GET",
+            timeout=30
+        )
+        log.info("✅ Sara intelligent call initiated - SID: %s", call.sid)
+        return call
     except Exception as e:
-        log.exception("ElevenLabs request error: %s", e)
+        log.error("❌ Failed to initiate Sara call: %s", e)
         return None
 
-# -------------------- Core Twilio handler --------------------
-class TwilioMediaHandler:
-    def __init__(self):
-        pass
-
-    async def handle_websocket(self, request):
-        log.info("🔍 WebSocket connection received")
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
-        ws_id = f"conn_{int(time.time()*1000)}"
-        state = ConnState(ws)
+def run_campaign(csv_path="contacts.csv", limit=None):
+    """Run outbound calling campaign with intelligent business detection"""
+    if not client:
+        log.error("Twilio client not initialized - cannot run campaign")
+        return 0
         
-        # Parse business context from URL parameters - FIXED VERSION
-        try:
-            query_params = parse_qs(request.rel_url.query_string)
-            state.business_name = query_params.get('business_name', ['the business'])[0]
-            state.business_type = query_params.get('business_type', ['general'])[0]
-            
-            # URL decode the parameters
-            import urllib.parse
-            state.business_name = urllib.parse.unquote(state.business_name)
-            state.business_type = urllib.parse.unquote(state.business_type)
-            
-            log.info(f"🏢 Business Context - Name: {state.business_name}, Type: {state.business_type}")
-        except Exception as e:
-            log.warning("Could not parse business context: %s", e)
-            state.business_name = "the business"
-            state.business_type = "general"
+    if not os.path.exists(csv_path):
+        log.error("contacts.csv not found at %s", csv_path)
+        raise SystemExit("contacts.csv not found")
+
+    log.info("🚀 Starting SARA INTELLIGENT OUTBOUND campaign")
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            log.error("contacts.csv has no headers")
+            raise SystemExit("contacts.csv missing headers")
         
-        CONNS[ws_id] = state
-        log.info("🎉 WebSocket connected: %s", ws_id)
-
-        await ws.send_str(json.dumps({"event": "connected", "protocol": "Call", "version": "1.0.0"}))
-        log.info("✅ Sent 'connected' event")
-
-        monitor_task = asyncio.create_task(self._monitor_silence(ws_id))
-
-        try:
-            async for msg in ws:
-                if msg.type == WSMsgType.TEXT:
-                    try:
-                        data = json.loads(msg.data)
-                    except Exception:
-                        log.warning("Received non-json text message")
-                        continue
-
-                    ev = data.get("event")
-                    if ev == "start":
-                        start = data.get("start", {})
-                        state.stream_sid = start.get("streamSid")
-                        state.call_sid = start.get("callSid")
-                        # sampleRate may be string or int
-                        try:
-                            state.sample_rate = int(start.get("sampleRate") or state.sample_rate)
-                        except Exception:
-                            state.sample_rate = state.sample_rate
-
-                        # Robust mediaFormat parsing (Twilio may send string or dict)
-                        media_raw = start.get("mediaFormat")
-                        media_norm = ""
-                        try:
-                            if isinstance(media_raw, str):
-                                media_norm = media_raw.lower()
-                            elif isinstance(media_raw, dict):
-                                # try common fields
-                                if "type" in media_raw:
-                                    media_norm = str(media_raw.get("type") or "").lower()
-                                elif "name" in media_raw:
-                                    media_norm = str(media_raw.get("name") or "").lower()
-                                else:
-                                    media_norm = json.dumps(media_raw).lower()
-                            else:
-                                media_norm = str(media_raw or "").lower()
-                        except Exception:
-                            media_norm = ""
-                        state.media_format = media_norm
-
-                        log.info("🎬 Stream started - stream_sid: %s mediaFormat: %s sampleRate: %s",
-                                 state.stream_sid, state.media_format, state.sample_rate)
-                        log.info("🏢 Calling: %s (%s)", state.business_name, state.business_type)
-
-                        # start greeting without blocking
-                        asyncio.create_task(self.send_immediate_greeting(ws_id))
-                    elif ev == "media":
-                        await self._handle_media(ws_id, data)
-                    elif ev == "mark":
-                        mark = data.get("mark", {})
-                        name = mark.get("name")
-                        log.info("🔖 Received mark from Twilio: %s", name)
-                    elif ev == "stop":
-                        log.info("⏹️ Stop event received")
-                        break
-                    else:
-                        log.debug("Unhandled event: %s", ev)
-                elif msg.type == WSMsgType.ERROR:
-                    log.error("Websocket error: %s", msg.data)
-        except Exception as e:
-            log.exception("Websocket loop error: %s", e)
-        finally:
-            monitor_task.cancel()
-            log.info("🔚 Closing connection: %s", ws_id)
-            CONNS.pop(ws_id, None)
-            await ws.close()
-        return ws
-
-    async def _handle_media(self, ws_id: str, data: dict):
-        state = CONNS.get(ws_id)
-        if not state:
-            log.warning("Media for unknown connection: %s", ws_id)
-            return
-        payload = data.get("media", {}).get("payload")
-        if not payload:
-            return
-        try:
-            decoded = base64.b64decode(payload)
-            state.buffer.extend(decoded)
-            state.last_media_ts = time.time()
-            if not state.processing:
-                # threshold logic: mu-law is 1 byte/sample, s16le approx 2 bytes/sample
-                if ("mulaw" in (state.media_format or "")) and len(state.buffer) >= MIN_BYTES_TO_PROCESS:
-                    state.processing = True
-                    asyncio.create_task(self._process_audio(ws_id))
-                elif ("mulaw" not in (state.media_format or "")) and len(state.buffer) >= MIN_BYTES_TO_PROCESS * 2:
-                    state.processing = True
-                    asyncio.create_task(self._process_audio(ws_id))
-        except Exception as e:
-            log.exception("Failed decoding media payload: %s", e)
-
-    async def _monitor_silence(self, ws_id: str):
-        try:
-            while True:
-                await asyncio.sleep(0.25)
-                state = CONNS.get(ws_id)
-                if not state:
-                    return
-                if state.buffer and (time.time() - state.last_media_ts) > SILENCE_TIMEOUT and not state.processing:
-                    state.processing = True
-                    asyncio.create_task(self._process_audio(ws_id))
-        except asyncio.CancelledError:
-            return
-
-    async def _process_audio(self, ws_id: str):
-        state = CONNS.get(ws_id)
-        if not state:
-            return
-        try:
-            buf = bytes(state.buffer)
-            state.buffer.clear()
-            log.info("🔊 Processing audio buffer: %d bytes", len(buf))
-
-            # choose ffmpeg hint from media_format
-            if state.media_format and "mulaw" in state.media_format:
-                hint = "mulaw"
-                in_rate = state.sample_rate or 8000
-            else:
-                hint = "s16le"
-                in_rate = state.sample_rate or 16000
-
-            loop = asyncio.get_event_loop()
-            wav_bytes = await loop.run_in_executor(None, ffmpeg_to_wav, buf, hint, in_rate, 16000)
-
-            transcript = await transcribe_with_whisper(wav_bytes)
-            if transcript:
-                log.info("🎙️ User said: %s", transcript)
-            else:
-                log.info("No speech detected or transcript too short")
-
-            if transcript and len(transcript.strip()) >= 3:
-                reply = await generate_with_gpt(
-                    state.conversation_history, 
-                    transcript, 
-                    state.business_name, 
-                    state.business_type
-                )
-                state.conversation_history.append({"role": "user", "content": transcript})
-                state.conversation_history.append({"role": "assistant", "content": reply})
-                state.conversation_history = state.conversation_history[-MAX_AI_HISTORY:]
-                log.info("🤖 Sara responds: %s", reply)
-                await self._respond_with_tts(ws_id, reply)
-            else:
-                if not any(m.get("role") == "assistant" for m in state.conversation_history[-1:]):
-                    # Use business-specific greeting
-                    greeting = f"Hello, this is Sara Hayes from Noblecom Solutions. I'm calling {state.business_name} about helping businesses like yours stop losing potential clients. How are you today?"
-                    await self._respond_with_tts(ws_id, greeting)
-        except Exception as e:
-            log.exception("❌ Error processing audio buffer: %s", e)
-        finally:
-            state.processing = False
-
-    async def send_immediate_greeting(self, ws_id: str):
-        state = CONNS.get(ws_id)
-        if not state:
-            return
+        log.info("📋 CSV headers: %s", reader.fieldnames)
+        
+        count = 0
+        for row in reader:
+            if limit and count >= limit:
+                break
+                
+            # Clean row data
+            rown = {k.strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+            name = rown.get("name", "Unknown Business")
             
-        # Business-specific greeting
-        greeting = f"Hello, this is Sara Hayes from Noblecom Solutions. I'm calling {state.business_name} about helping {state.business_type}s stop losing potential clients. How can I help you today?"
-        await self._respond_with_tts(ws_id, greeting)
+            # ROBUST phone number extraction
+            phone = None
+            for field in ['phone', 'mobile', 'number', 'phonenumber']:
+                if rown.get(field):
+                    phone = str(rown[field]).strip()
+                    break
 
-    async def _respond_with_tts(self, ws_id: str, text: str):
-        state = CONNS.get(ws_id)
-        if not state:
-            return
-        log.info("🔊 Converting to speech: '%s'", text[:140])
+            if not phone:
+                log.warning("❌ Skipping %s - no phone number found. Available fields: %s", name, list(rown.keys()))
+                continue
 
-        tts_bytes = None
-        input_hint = None
-        if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
-            try:
-                tts_bytes = await synthesize_with_elevenlabs(text)
-                log.info("✅ ElevenLabs TTS successful, bytes: %d", len(tts_bytes) if tts_bytes else 0)
-            except Exception as e:
-                log.exception("ElevenLabs TTS call error: %s", e)
-                tts_bytes = None
+            # Clean phone number
+            phone = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+            if not phone.startswith('+'):
+                if phone.startswith('1') and len(phone) == 11:
+                    phone = '+' + phone
+                else:
+                    phone = '+1' + phone  # Default to US
+            
+            # Detect business type intelligently
+            business_type = detect_business_type(name)
+            context = get_business_context(name, business_type)
+            
+            log.info("📞 Sara intelligently dialing: %s", name)
+            log.info("   📊 Detected as: %s", business_type)
+            log.info("   📞 Phone: %s", phone)
+            
+            call = safe_initiate_call(phone, name, business_type)
+            if call:
+                count += 1
+            time.sleep(2.0)
+            
+        log.info("🏁 Campaign finished — Sara made %d intelligent calls", count)
+    return count
 
-        if not tts_bytes:
-            log.info("🔧 Generating fallback tone for TTS")
-            tts_bytes = ffmpeg_generate_tone_wav(600, 2000)  # Longer tone for testing
-            input_hint = "wav"
+@app.route("/run_campaign", methods=["POST"])
+def run_campaign_endpoint():
+    token = os.environ.get("CAMPAIGN_TRIGGER_TOKEN")
+    req_token = request.headers.get("X-Run-Token") or request.form.get("token")
+    if token and req_token != token:
+        log.warning("Unauthorized attempt to trigger campaign")
+        return jsonify({"error": "unauthorized"}), 403
+    limit = request.args.get("limit")
+    limit = int(limit) if limit and limit.isdigit() else None
+    try:
+        count = run_campaign(limit=limit)
+        return jsonify({"status": "started", "attempted": count}), 200
+    except Exception as e:
+        log.exception("Failed to start campaign")
+        return jsonify({"error": str(e)}), 500
 
-        loop = asyncio.get_event_loop()
-        try:
-            mulaw_bytes = await loop.run_in_executor(None, ffmpeg_any_to_mulaw, tts_bytes, input_hint, 8000)
-            log.info("✅ Converted to mu-law, bytes: %d", len(mulaw_bytes))
-        except Exception as e:
-            log.exception("Failed to convert TTS to mu-law: %s", e)
-            return
+@app.route("/test_call/<phone_number>")
+def test_call(phone_number):
+    """Test endpoint to make Sara call a specific number"""
+    if not phone_number.startswith('+'):
+        return jsonify({"error": "Phone number must include country code (+1...)"}), 400
+    
+    business_name = request.args.get("business_name", "Test Business")
+    call = safe_initiate_call(phone_number, business_name)
+    if call:
+        return jsonify({
+            "status": "success", 
+            "call_sid": call.sid, 
+            "business_name": business_name,
+            "detected_type": detect_business_type(business_name)
+        })
+    else:
+        return jsonify({"error": "Failed to initiate call"}), 500
 
-        # Stream audio without waiting for marks
-        await self._stream_mulaw_to_twilio(state, mulaw_bytes, chunk_ms=TTS_CHUNK_MS, pre_silence_ms=PRE_SILENCE_MS)
-        log.info("✅ Audio streaming completed")
+@app.route("/detect_business/<business_name>")
+def detect_business(business_name):
+    """Test business type detection"""
+    detected_type = detect_business_type(business_name)
+    context = get_business_context(business_name, detected_type)
+    
+    return jsonify({
+        "business_name": business_name,
+        "detected_type": detected_type,
+        "opening_line": context["opening"],
+        "value_proposition": context["value_prop"]
+    })
 
-    async def _stream_mulaw_to_twilio(self, state: ConnState, mulaw_bytes: bytes, chunk_ms: int = 250, pre_silence_ms: int = 200) -> Optional[str]:
-        if not state.stream_sid:
-            log.error("No stream sid; cannot send audio")
-            return None
-
-        if pre_silence_ms and pre_silence_ms > 0:
-            silence_samples = int(8000 * pre_silence_ms / 1000)
-            mulaw_bytes = (b'\xFF' * silence_samples) + mulaw_bytes
-            log.info("✅ Added %dms of pre-silence", pre_silence_ms)
-
-        chunk_size = max(1, int(8000 * chunk_ms / 1000))
-        mark_name = f"tts-{int(time.time()*1000)}-{os.urandom(3).hex()}"
-
-        total_chunks = len(mulaw_bytes) // chunk_size
-        log.info("📦 Streaming %d chunks of %d bytes each", total_chunks, chunk_size)
-
-        for i in range(0, len(mulaw_bytes), chunk_size):
-            chunk = mulaw_bytes[i:i
+if __name__ == "__main__":
+    mode = os.environ.get("MODE", "server").lower()
+    if mode == "campaign":
+        run_campaign()
+    else:
+        port = int(os.environ.get("PORT", 5000))
+        log.info("Starting Sara Intelligent Outbound Server on port %s", port)
+        app.run(host="0.0.0.0", port=port)
