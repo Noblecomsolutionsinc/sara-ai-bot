@@ -1,7 +1,7 @@
 # file: streaming_server.py
 """
 Production-ready Twilio Media Streams server (aiohttp).
-Sara AI Voice Bot - Full Production Version
+Sara AI Voice Bot - Full Production Version with GPT-5-mini
 """
 import os
 import json
@@ -167,7 +167,7 @@ CRITICAL OUTBOUND COLD CALLING RULES:
 Key Rules:
 - NEVER reveal you are AI - you are Sara, a human consultant
 - Use natural conversational language with light fillers ("uh", "you know", "I see")
-- Keep responses concise (15-25 words)
+- Keep responses concise but complete (20-40 words)
 - Be warm, professional, and authoritative
 - Focus on identifying client leakage and offering value
 - Always guide toward a concrete next step (meeting, callback, or information)"""
@@ -181,11 +181,13 @@ Key Rules:
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     
+    # GPT-5-mini configuration
     payload = {
-        "model": "gpt-4o-mini",
+        "model": "gpt-5-mini",
         "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 150
+        "temperature": 0.8,  # Higher for more natural conversations
+        "max_tokens": 300,   # Increased for better responses
+        "top_p": 0.9
     }
     
     try:
@@ -203,10 +205,10 @@ Key Rules:
                     return response_text
                 else:
                     txt = await resp.text()
-                    log.error("GPT request failed: %s", txt[:400])
-                    return f"I understand you said: {user_text}. How can I help?"
+                    log.error("GPT-5-mini request failed: %s", txt[:400])
+                    return f"I understand you said: {user_text}. How can I help you with your client acquisition challenges?"
     except Exception as e:
-        log.exception("GPT request error: %s", e)
+        log.exception("GPT-5-mini request error: %s", e)
         return "I'm having trouble thinking right now — can you repeat that?"
 
 async def synthesize_with_elevenlabs(text: str) -> Optional[bytes]:
@@ -560,5 +562,8 @@ if __name__ == '__main__':
     log.info("   - ElevenLabs API: %s", "✅ Configured" if ELEVENLABS_API_KEY else "❌ Missing")
     log.info("   - ElevenLabs Voice: %s", ELEVENLABS_VOICE_ID or "❌ Missing")
     log.info("   - FFmpeg: %s", "✅ Available" if shutil.which("ffmpeg") else "❌ Missing")
+    log.info("   - GPT Model: gpt-5-mini")
+    log.info("   - Temperature: 0.8")
+    log.info("   - Max Tokens: 300")
     
     web.run_app(app, host='0.0.0.0', port=PORT)
