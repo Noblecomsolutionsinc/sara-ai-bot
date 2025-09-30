@@ -14,7 +14,7 @@ import json
 import time
 import base64
 import logging
-import asyncio
+import asyncio  # ←←← CRITICAL MISSING IMPORT ←←←
 import pathlib
 import subprocess
 import tempfile
@@ -134,10 +134,10 @@ async def generate_with_gpt(history: list, user_text: str) -> str:
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     payload = {
-        "model": "gpt-5-mini",
+        "model": "gpt-4o-mini",  # ←←← FIXED MODEL NAME ←←←
         "messages": messages,
         "temperature": 0.7,
-        "max_completion_tokens": 150
+        "max_tokens": 150  # ←←← FIXED PARAMETER NAME ←←←
     }
     try:
         async with ClientSession() as sess:
