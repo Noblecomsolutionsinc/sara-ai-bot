@@ -1,22 +1,31 @@
-# Ignore environment files
+# Environment files
 .env
 *.env
 
-# Ignore API keys or credentials
+# API keys or credentials
 *.key
 *.pem
 
-# Ignore Python cache files
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
 
-# Ignore logs
+# Logs
 *.log
 
-# Ignore OS junk
+# OS junk
 .DS_Store
 Thumbs.db
 
-# Ignore virtual environment (if you make one)
+# Virtual env
+.venv/
 venv/
+
+# Large binaries and test outputs (do NOT push)
+*.exe
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe
+tmp/
+test_output/
