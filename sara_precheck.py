@@ -12,11 +12,14 @@ from dotenv import load_dotenv
 # --- Load .env locally ---
 load_dotenv()
 
-# --- Logging setup ---
+# --- Logging setup with Unicode fix ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler("sara_precheck.log"), logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler("sara_precheck.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 log = logging.getLogger("sara-precheck")
 
@@ -52,7 +55,7 @@ def check_flask_health():
     try:
         resp = requests.get(f"{FLASK_URL}/health", timeout=5)
         if resp.status_code == 200:
-            log.info("Flask server healthy ✅")
+            log.info("Flask server healthy")
             return True
         else:
             log.error("Flask health check failed: %s", resp.status_code)
@@ -64,9 +67,9 @@ def check_flask_health():
 # --- 2️⃣ Check WebSocket streaming server ---
 async def check_streaming_server():
     try:
-        # connect with a short timeout
-        async with websockets.connect(STREAM_URL, ping_interval=10, close_timeout=5) as ws:
-            log.info("Streaming server connected ✅")
+        # Fix: Simple connection without timeout parameters
+        async with websockets.connect(STREAM_URL) as ws:
+            log.info("Streaming server connected")
             return True
     except Exception:
         log.exception("Streaming server connection failed")
@@ -119,7 +122,7 @@ def run_campaign():
             if call:
                 log.info("%s call %d/%d: %s (%s) SID=%s", mode_text, idx, count, name, phone, call.sid)
             if dry_run_mode:
-                log.info("Dry-run finished ✅")
+                log.info("Dry-run finished")
                 break
 
 # --- 5️⃣ Run all checks ---
@@ -130,14 +133,14 @@ async def main():
     try:
         stream_ok = await asyncio.wait_for(check_streaming_server(), timeout=8)
     except asyncio.TimeoutError:
-        log.error("Streaming server check timed out ❌")
+        log.error("Streaming server check timed out")
         stream_ok = False
 
     if flask_ok and stream_ok:
-        log.info("All servers live ✅")
+        log.info("All servers live")
         run_campaign()
     else:
-        log.error("Pre-check failed ❌")
+        log.error("Pre-check failed")
         if not flask_ok:
             log.error("Flask server down")
         if not stream_ok:
