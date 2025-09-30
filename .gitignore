@@ -1,3 +1,12 @@
+# Ignore Windows FFmpeg binaries
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe
+
+# Ignore test output
+test_output/
+
+
 # Environment files
 .env
 *.env
