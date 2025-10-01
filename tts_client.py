@@ -1,47 +1,75 @@
-# tts_client.py
 import os
-import requests
+import logging
 from pathlib import Path
+import requests
+from dotenv import load_dotenv
 
-ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-ELEVEN_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID")
-ELEVEN_TIMEOUT = int(os.environ.get("ELEVENLABS_TTS_TIMEOUT", 120))
+# --------------------------------------------------
+# Load env
+# --------------------------------------------------
+load_dotenv()
 
-# Where generated mp3s will be stored
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "default")
+
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("tts_client")
+
+# --------------------------------------------------
+# Output dir
+# --------------------------------------------------
 TTS_OUT_DIR = Path("static/tts")
 TTS_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def text_to_speech(text, filename="output.mp3"):
+# --------------------------------------------------
+# ElevenLabs API
+# --------------------------------------------------
+def text_to_speech(text: str) -> str:
     """
-    Convert text to speech using ElevenLabs API.
-    :param text: Text input
-    :param filename: Output filename
-    :return: Path to generated mp3
+    Convert text into speech via ElevenLabs API
+    Returns the saved MP3 file path
     """
-    if not ELEVEN_API_KEY or not ELEVEN_VOICE_ID:
-        raise RuntimeError("Missing ElevenLabs API credentials")
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError("❌ ELEVENLABS_API_KEY not set")
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
 
     headers = {
-        "xi-api-key": ELEVEN_API_KEY,
+        "Accept": "audio/mpeg",
+        "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json"
     }
 
     payload = {
         "text": text,
-        "voice_settings": {"stability": 0.6, "similarity_boost": 0.7}
+        "voice_settings": {"stability": 0.6, "similarity_boost": 0.8}
     }
 
-    out_path = TTS_OUT_DIR / filename
+    try:
+        logger.info(f"🔊 Sending TTS request: {text[:60]}...")
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
 
-    response = requests.post(url, headers=headers, json=payload, stream=True, timeout=ELEVEN_TIMEOUT)
-    response.raise_for_status()
+        if response.status_code != 200:
+            logger.error(f"❌ TTS API error {response.status_code}: {response.text}")
+            raise RuntimeError(f"TTS API error {response.status_code}")
 
-    with open(out_path, "wb") as f:
-        for chunk in response.iter_content(8192):
-            if chunk:
-                f.write(chunk)
+        # Save file
+        file_path = TTS_OUT_DIR / f"tts_{hash(text)}.mp3"
+        with open(file_path, "wb") as f:
+            f.write(response.content)
 
-    return str(out_path)
+        logger.info(f"✅ TTS generated: {file_path}")
+        return str(file_path)
+
+    except requests.exceptions.Timeout:
+        logger.error("⏱️ TTS request timed out")
+        return "[System Error: TTS timeout]"
+    except Exception as e:
+        logger.error(f"❌ TTS generation failed: {e}")
+        return "[System Error: TTS failure]"
