@@ -1,124 +1,134 @@
 # app.py
 import os
 import logging
-from pathlib import Path
-from flask import Flask, request, jsonify, abort, Response
-from twilio.twiml.voice_response import VoiceResponse, Start, Stream
-from twilio.request_validator import RequestValidator
-from twilio.rest import Client as TwilioClient
+from flask import Flask, request, Response, jsonify
 import redis
+import html
 
-from json_loader import sara_store
+# ------ Logging ------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("sara_ai_bot")
 
-LOG = logging.getLogger("app")
-logging.basicConfig(level=logging.INFO)
-
-app = Flask(__name__, static_folder="static")
-
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+# ------ Config ------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-PUBLIC_STREAMING_URL = os.getenv("PUBLIC_STREAMING_URL")  # wss://...
-SERVER_URL = os.getenv("SERVER_URL")  # https://...
-MP3_RETENTION_HOURS = int(os.getenv("MP3_RETENTION_HOURS", "48"))
+PUBLIC_STREAMING_URL = os.getenv("PUBLIC_STREAMING_URL")  # e.g. "wss://sara-ai-streaming.onrender.com/ws"
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
+SARA_NAME = os.getenv("SARA_NAME", "Sara Hayes")
+COMPANY_NAME = os.getenv("COMPANY_NAME", "Noblecom Solutions")
 
-redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
-twilio_client = None
-if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+if not PUBLIC_STREAMING_URL:
+    logger.warning("PUBLIC_STREAMING_URL is not set; make sure Twilio can reach your streaming server.")
 
-validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+# ------ Redis (sync client for the Flask app) ------
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-CALLMAP_KEY = "sara:callmap:"  # hash mapping CallSid -> session_id
+# ------ Flask app ------
+app = Flask(__name__, static_folder="static", static_url_path="/static")
 
-def validate_twilio_request(req):
-    try:
-        if req.args.get("skip_validation") == "1":
-            return True
-        if req.headers.get("X-SKIP-TWILIO-VALIDATION", "").lower() == "true":
-            return True
-    except Exception:
-        pass
-
-    if not validator:
-        return True
-
-    signature = req.headers.get("X-Twilio-Signature", "")
-    url = req.url
-    form = req.form.to_dict()
-    try:
-        return validator.validate(url, form, signature)
-    except Exception:
-        LOG.exception("Twilio validation failed")
-        return False
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "twilio_configured": bool(twilio_client is not None)})
+    return jsonify({"status": "ok", "service": "sara-ai-bot"}), 200
 
-@app.route("/outbound", methods=["POST"])
-def outbound():
-    if not validate_twilio_request(request):
-        LOG.warning("Invalid Twilio signature on /outbound")
-        return abort(403)
-    call_sid = request.form.get("CallSid") or ""
-    LOG.info("Outbound webhook invoked CallSid=%s", call_sid)
 
-    vr = VoiceResponse()
-    # Start Twilio Media Stream to the streaming server
-    st = Start()
-    stream = Stream(url=PUBLIC_STREAMING_URL)
-    stream.parameter(name="callSid", value=call_sid)
-    st.append(stream)
-    vr.append(st)
+@app.route("/voice", methods=["GET", "POST"])
+def voice():
+    """
+    Twilio webhook to start a call's Media Stream.
+    Expects:
+      - Query params (from call_runner.py): name, industry
+      - Twilio POST form field: CallSid (Twilio will supply on initial request)
+    Behavior:
+      - Store system_prompt in Redis under call:{call_sid}:meta so streaming_server picks it up.
+      - Return TwiML that instructs Twilio to <Start><Stream url="PUBLIC_STREAMING_URL">...
+    """
+    # Quick dev bypass for Twilio validation if needed (do NOT use in prod)
+    skip_validation = request.args.get("skip_validation", request.form.get("skip_validation", "0")) == "1"
 
-    # keep open for at least a short period while pipeline runs
-    vr.pause(length=60)
-    vr.say("Thank you. Goodbye.", voice="alice")
-    return Response(str(vr), mimetype="application/xml")
+    # Extract personalization from query params (call_runner.py sets them on the URL)
+    name = request.args.get("name") or request.form.get("name") or "there"
+    industry = request.args.get("industry") or request.form.get("industry") or "your industry"
 
-@app.route("/internal/tts_ready", methods=["POST"])
-def tts_ready():
-    data = request.get_json() or {}
-    session_id = data.get("call_id") or data.get("session_id")
-    mp3_path = data.get("file")
-    LOG.info("tts_ready: session=%s file=%s", session_id, mp3_path)
-    if not session_id or not mp3_path:
-        return jsonify({"status": "bad_request"}), 400
-
-    # find CallSid from CALLMAP
-    call_sid = None
-    try:
-        all_map = redis_conn.hgetall(CALLMAP_KEY)
-        for k, v in all_map.items():
-            if v == session_id:
-                call_sid = k
-                break
-    except Exception:
-        LOG.exception("Failed to read callmap from redis")
-
+    # Twilio CallSid — Twilio usually sends this as POST form field CallSid
+    call_sid = request.values.get("CallSid") or request.args.get("CallSid") or request.form.get("callSid") or None
     if not call_sid:
-        LOG.info("No active call found for session %s", session_id)
-        return jsonify({"status": "no_active_call"})
+        # It's possible Twilio hits this URL before CallSid is populated (rare for outbound), but we still proceed.
+        # We'll generate a fallback id to keep things traceable; streaming server will supply a streamSid later.
+        call_sid = f"call-fallback-{os.urandom(6).hex()}"
+        logger.debug("No CallSid provided in webhook; generated fallback: %s", call_sid)
 
-    if not twilio_client:
-        LOG.error("Twilio client not configured")
-        return jsonify({"status": "twilio_not_configured"}), 500
+    # Build a dynamic system prompt for this call
+    # Keep the prompt concise and instructive (avoid leaking secrets)
+    # Escape user-provided fields to avoid accidental injection into TTS/GPT contexts
+    safe_name = html.escape(name)
+    safe_industry = html.escape(industry)
+    system_prompt = (
+        f"You are {SARA_NAME}, a friendly and professional outbound AI caller representing {COMPANY_NAME}. "
+        f"You are calling {safe_name}, who works in the {safe_industry} industry. "
+        "Your goal is to quickly build rapport and book a meeting. Be human-like, concise, and when interrupted stop speaking immediately and listen. "
+        "If the prospect asks for pricing or technical detail, offer to set a follow-up meeting with a specialist. "
+        "Do not ask for sensitive personal data."
+    )
 
-    if mp3_path.startswith("http://") or mp3_path.startswith("https://"):
-        media_url = mp3_path
-    else:
-        media_url = f"{SERVER_URL.rstrip('/')}/{mp3_path.lstrip('/')}" if SERVER_URL else mp3_path
-
-    new_twiml = f"<Response><Play>{media_url}</Play></Response>"
+    # Persist system prompt and metadata in Redis so the streaming server can use it when the stream 'start' arrives
+    meta_key = f"call:{call_sid}:meta"
     try:
-        twilio_client.calls(call_sid).update(twiml=new_twiml)
-        LOG.info("Injected TTS into call %s -> %s", call_sid, media_url)
-        return jsonify({"status": "ok", "call_sid": call_sid})
-    except Exception:
-        LOG.exception("Failed to update Twilio call with TTS")
-        return jsonify({"status": "error"}), 500
+        r.hset(meta_key, mapping={
+            "system_prompt": system_prompt,
+            "name": safe_name,
+            "industry": safe_industry,
+            "status": "incoming",
+            "playback_active": "0",
+            "request_playback_stop": "0"
+        })
+        # Optionally set a mapping for sara:callmap to find streamSid by CallSid if needed
+        # r.hset("sara:callmap", call_sid, "")  # streaming_server will populate streamSid later if necessary
+        logger.info("Saved system_prompt for call %s (name=%s, industry=%s)", call_sid, safe_name, safe_industry)
+    except Exception as e:
+        logger.exception("Failed to write system_prompt into Redis for call %s: %s", call_sid, e)
+
+    # Build TwiML to start a Media Stream pointing to our PUBLIC_STREAMING_URL/ws (Twilio expects a wss endpoint)
+    # Twilio Media Streams expects <Start><Stream url="wss://..."><Parameter name="callSid" value="..."/></Stream></Start>
+    if not PUBLIC_STREAMING_URL:
+        logger.error("PUBLIC_STREAMING_URL missing — cannot start Media Stream. Returning empty TwiML.")
+        resp_xml = "<?xml version='1.0' encoding='UTF-8'?><Response><Say>Server misconfigured. No streaming URL set.</Say></Response>"
+        return Response(resp_xml, mimetype="application/xml")
+
+    # Ensure the stream URL includes /ws or the correct path; allow admins to set PUBLIC_STREAMING_URL accordingly
+    stream_url = PUBLIC_STREAMING_URL.rstrip("/")
+
+    # TwiML for starting the stream
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Stream url="{stream_url}">
+      <Parameter name="callSid" value="{call_sid}"/>
+      <Parameter name="name" value="{html.escape(name)}"/>
+      <Parameter name="industry" value="{html.escape(industry)}"/>
+    </Stream>
+  </Start>
+  <!-- Optionally play a short hold or greeting until the AI responds -->
+  <Say voice="alice">Please hold while I connect you.</Say>
+</Response>"""
+
+    logger.info("Returning TwiML Start Stream for CallSid=%s -> %s", call_sid, stream_url)
+    return Response(twiml, mimetype="application/xml")
+
+
+# Optional endpoint to inspect call metadata (debug)
+@app.route("/call_meta/<call_sid>", methods=["GET"])
+def call_meta(call_sid):
+    try:
+        meta = r.hgetall(f"call:{call_sid}:meta") or {}
+        history = r.get(f"call:{call_sid}:history") or "[]"
+        return jsonify({"meta": meta, "history": history})
+    except Exception as e:
+        logger.exception("Failed to fetch meta for %s: %s", call_sid, e)
+        return jsonify({"error": "failed to fetch"}), 500
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    # Only used for local testing. In production Render runs via gunicorn app:app
+    port = int(os.getenv("PORT", 5000))
+    logger.info("Starting sara-ai-bot Flask on 0.0.0.0:%d (development)", port)
+    app.run(host="0.0.0.0", port=port, debug=False)
