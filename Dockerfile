@@ -1,26 +1,27 @@
-# Use an official Python runtime as a base
+# Use official Python slim image
 FROM python:3.11-slim
-
-# Install system dependencies (ffmpeg + curl)
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    ffmpeg \
+    libmagic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first (better caching)
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all project files
+# Copy application files
 COPY . .
 
-# Expose port 5000 for Flask
+# Expose port (Render will map this)
 EXPOSE 5000
 
-# Command to run your app
-CMD ["gunicorn", "app:app", "--workers=1", "--threads=2", "--timeout=300", "--bind", "0.0.0.0:5000"]
+# Default command for Render (can be overridden in render.yaml)
+CMD ["gunicorn", "app:app", "--workers=1", "--threads=2", "--timeout=300"]
