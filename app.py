@@ -41,9 +41,29 @@ validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 CALLMAP_KEY = "sara:callmap:"  # hash: CallSid -> session_id
 
 def validate_twilio_request(req):
-    # Validate Twilio request signature when token available; otherwise skip (helpful for testing)
+    """
+    Validate Twilio request signature when token available.
+    For local/manual testing you can bypass validation by:
+      - adding ?skip_validation=1 to the URL, OR
+      - sending header X-SKIP-TWILIO-VALIDATION: true
+
+    IMPORTANT: do NOT leave bypass enabled in production unless you understand the risk.
+    """
+    # Explicit bypass for quick testing
+    try:
+        if req.args.get("skip_validation") == "1":
+            LOG.info("Bypassing Twilio validation via query param skip_validation=1")
+            return True
+        if req.headers.get("X-SKIP-TWILIO-VALIDATION", "").lower() == "true":
+            LOG.info("Bypassing Twilio validation via header X-SKIP-TWILIO-VALIDATION")
+            return True
+    except Exception:
+        pass
+
+    # If Twilio validator not configured, allow (useful for dev)
     if not validator:
         return True
+
     signature = req.headers.get("X-Twilio-Signature", "")
     url = req.url
     form = req.form.to_dict()
@@ -52,6 +72,7 @@ def validate_twilio_request(req):
     except Exception:
         LOG.exception("Twilio request validation failed")
         return False
+
 
 @app.route("/health", methods=["GET"])
 def health():
