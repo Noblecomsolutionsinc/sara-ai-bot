@@ -113,11 +113,26 @@ async def handler(ws, path):
 if __name__ == "__main__":
     LOG.info("Starting streaming server on %s:%s", HOST, PORT)
 
-    # Optional small HTTP handler to respond to non-upgrade GET requests (health check).
-    # This prevents Render / other probes from causing "connection rejected (400 Bad Request)" logs.
+    # Detailed process_request that logs handshake headers so we can diagnose 400 rejections.
     async def process_request(path, request_headers):
-        # If the incoming request is a plain GET to root or /health, return a 200 response
-        # The websockets library will *not* attempt a websocket upgrade in this case.
+        try:
+            # Log path and selected important headers for diagnosis
+            debug_info = {
+                "path": path,
+                "Host": request_headers.get("Host"),
+                "Upgrade": request_headers.get("Upgrade"),
+                "Connection": request_headers.get("Connection"),
+                "Sec-WebSocket-Key": request_headers.get("Sec-WebSocket-Key"),
+                "Sec-WebSocket-Version": request_headers.get("Sec-WebSocket-Version"),
+                "Sec-WebSocket-Protocol": request_headers.get("Sec-WebSocket-Protocol"),
+                "User-Agent": request_headers.get("User-Agent"),
+                "Origin": request_headers.get("Origin"),
+            }
+            LOG.info("ws-handshake attempt: %s", json.dumps(debug_info))
+        except Exception:
+            LOG.exception("failed to log handshake headers")
+
+        # If the request is a simple GET to root or /health, respond with 200 OK.
         if path in ("/", "/health"):
             body = b"ok"
             headers = [
@@ -125,21 +140,22 @@ if __name__ == "__main__":
                 ("Content-Length", str(len(body))),
             ]
             return 200, headers, body
-        # Returning None means "try to upgrade to a websocket" — do nothing here for other paths
+
+        # Otherwise return None so websockets attempts to perform the upgrade.
         return None
 
-    # Accept Twilio's 'twilio' subprotocol explicitly so the handshake succeeds.
-    # We keep reasonable limits for frame size and queue depth.
+    # Accept the Twilio subprotocols we expect; still allow upgrade attempts
     start_server = websockets.serve(
         handler,
         HOST,
         PORT,
         process_request=process_request,
-        subprotocols=["twilio"],
+        subprotocols=["twilio", "twilio.v1"],
         max_size=2**20,
         max_queue=64,
     )
 
     asyncio.get_event_loop().run_until_complete(start_server)
     asyncio.get_event_loop().run_forever()
+
 
