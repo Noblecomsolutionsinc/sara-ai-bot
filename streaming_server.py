@@ -113,10 +113,8 @@ async def handler(ws, path):
 if __name__ == "__main__":
     LOG.info("Starting streaming server on %s:%s", HOST, PORT)
 
-    # Detailed process_request that logs handshake headers so we can diagnose 400 rejections.
     async def process_request(path, request_headers):
         try:
-            # Log path and selected important headers for diagnosis
             debug_info = {
                 "path": path,
                 "Host": request_headers.get("Host"),
@@ -132,7 +130,6 @@ if __name__ == "__main__":
         except Exception:
             LOG.exception("failed to log handshake headers")
 
-        # If the request is a simple GET to root or /health, respond with 200 OK.
         if path in ("/", "/health"):
             body = b"ok"
             headers = [
@@ -140,22 +137,21 @@ if __name__ == "__main__":
                 ("Content-Length", str(len(body))),
             ]
             return 200, headers, body
-
-        # Otherwise return None so websockets attempts to perform the upgrade.
         return None
 
-    # Accept the Twilio subprotocols we expect; still allow upgrade attempts
+    # NOTE: no explicit subprotocols list here — we accept whatever Twilio requests.
     start_server = websockets.serve(
         handler,
         HOST,
         PORT,
         process_request=process_request,
-        subprotocols=["twilio", "twilio.v1"],
         max_size=2**20,
         max_queue=64,
+        origins=None,
     )
 
     asyncio.get_event_loop().run_until_complete(start_server)
     asyncio.get_event_loop().run_forever()
+
 
 
