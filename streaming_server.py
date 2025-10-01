@@ -9,35 +9,41 @@ from pathlib import Path
 
 import websockets
 import redis
-from tasks import process_audio
+
+from tasks import process_audio  # celery task - call .delay(...)
 from gpt_client import call_gpt
 from json_loader import sara_store
 
-LOG = logging.getLogger("streaming_server")
+# Logging
 logging.basicConfig(level=logging.INFO)
+LOG = logging.getLogger("streaming_server")
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+# Configs
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis_conn = redis.from_url(REDIS_URL)
 
-# Render sets PORT env
 PORT = int(os.getenv("PORT", os.getenv("STREAMING_SERVER_PORT", "8765")))
 HOST = "0.0.0.0"
 
-AUDIO_LIST_PREFIX = "sara:audio:"  # redis lists
-META_PREFIX = "sara:meta:"
+AUDIO_LIST_PREFIX = "sara:audio:"     # redis list per session: sara:audio:{session}
+META_PREFIX = "sara:meta:"            # redis hash per session meta
+CALLMAP_KEY = "sara:callmap:"         # hash mapping CallSid -> session
 
-def audio_list_key(session_id):
+def audio_list_key(session_id: str) -> str:
     return AUDIO_LIST_PREFIX + session_id
 
-def meta_key(session_id):
+def meta_key(session_id: str) -> str:
     return META_PREFIX + session_id
 
-def set_meta(session_id, data: dict):
-    redis_conn.hset(meta_key(session_id), mapping=data)
+def set_meta(session_id: str, data: dict):
+    try:
+        redis_conn.hset(meta_key(session_id), mapping=data)
+    except Exception:
+        LOG.exception("failed to set meta for %s", session_id)
 
 async def handler(ws, path):
-    session_id = str(uuid.uuid4())
-    LOG.info("ws connected session %s path %s", session_id, path)
+    session = str(uuid.uuid4())
+    LOG.info("ws connected session %s path %s", session, path)
     buffer = deque(maxlen=600)
     try:
         async for raw in ws:
@@ -47,50 +53,62 @@ async def handler(ws, path):
                 continue
             ev = msg.get("event")
             if ev == "start":
-                start = msg.get("start", {})
-                call_sid = start.get("callSid") or start.get("sessionId")
-                set_meta(session_id, {"call_sid": call_sid, "started_at": start.get("timestamp", "")})
-                LOG.info("stream start: session=%s call_sid=%s", session_id, call_sid)
+                start = msg.get("start", {}) or {}
+                # Twilio may send callSid in different fields depending on stream version
+                call_sid = start.get("callSid") or start.get("call_sid") or start.get("sessionId") or start.get("session_id")
+                if call_sid:
+                    try:
+                        # record mapping CallSid -> our generated session id
+                        redis_conn.hset(CALLMAP_KEY, call_sid, session)
+                        LOG.info("mapped callSid %s -> session %s", call_sid, session)
+                    except Exception:
+                        LOG.exception("failed to store callmap for %s -> %s", call_sid, session)
+                set_meta(session, {"call_sid": call_sid or "", "started_at": start.get("timestamp", "")})
+                LOG.info("stream start: session=%s call_sid=%s", session, call_sid)
             elif ev == "media":
-                payload = msg.get("media", {}).get("payload")
-                ts = msg.get("timestamp") or ""
+                media = msg.get("media", {}) or {}
+                payload = media.get("payload")
+                ts = msg.get("timestamp", "")
                 if payload:
-                    # push base64 chunk into Redis list as JSON
-                    redis_conn.rpush(audio_list_key(session_id), json.dumps({"ts": ts, "b64": payload}))
+                    # each payload is base64 PCM chunk; push JSON to Redis list
+                    try:
+                        redis_conn.rpush(audio_list_key(session), json.dumps({"ts": ts, "b64": payload}))
+                    except Exception:
+                        LOG.exception("failed to push audio chunk to redis for session %s", session)
                     buffer.append(payload)
-                    # every N frames run a quick intent check
+                    # Do a quick intent check every N frames to decide if heavy processing is needed
                     if len(buffer) >= 12:
                         buffer.clear()
-                        prompt_short = ""
+                        # Use short system prompt if present to keep latency low
                         if isinstance(sara_store.system_prompt, dict):
-                            prompt_short = sara_store.system_prompt.get("realtime_short", "") or sara_store.system_prompt.get("text", "")
+                            prompt_short = sara_store.system_prompt.get("realtime_short") or sara_store.system_prompt.get("text", "")
                         else:
                             prompt_short = str(sara_store.system_prompt or "")
-                        # we only provide a placeholder transcript to keep latency down
-                        placeholder = "[short audio segment captured]"
-                        prompt = f"{prompt_short}\nTranscript: {placeholder}\nReturn strict JSON with keys 'intent' and 'action' (action can be 'process_audio' or 'none')."
-                        resp = call_gpt(prompt, max_tokens=48, temperature=0.0)
-                        LOG.info("quick_gpt session=%s resp=%s", session_id, str(resp)[:200])
-                        # Simple heuristic: if model mentions process_audio schedule heavy job
-                        if resp and ("process_audio" in json.dumps(resp).lower() or "summary" in json.dumps(resp).lower()):
-                            process_audio.delay(session_id, do_asr=False)
-                            LOG.info("scheduled process_audio for session %s", session_id)
+                        placeholder_transcript = "[short audio segment captured]"
+                        prompt = f"{prompt_short}\nTranscript: {placeholder_transcript}\nReturn strict JSON with keys 'intent' and 'action'."
+                        try:
+                            resp = call_gpt(prompt, max_tokens=48, temperature=0.0)
+                            LOG.info("quick_gpt session=%s resp=%s", session, str(resp)[:200])
+                            resp_text = json.dumps(resp).lower() if resp else ""
+                            if "process_audio" in resp_text or "summary" in resp_text or "intent" in resp_text:
+                                # schedule background processing to do heavy ASR/GPT and TTS
+                                process_audio.delay(session, do_asr=False)
+                                LOG.info("scheduled process_audio for session %s", session)
+                        except Exception:
+                            LOG.exception("quick_gpt failed for session %s", session)
             elif ev == "stop":
-                LOG.info("stream stop for session %s", session_id)
-                # schedule final processing
-                process_audio.delay(session_id, do_asr=True if os.environ.get("ENABLE_ASR", "false").lower() == "true" else False)
+                LOG.info("stream stop for session %s", session)
+                # schedule final processing; enable ASR if configured
+                enable_asr = os.environ.get("ENABLE_ASR", "false").lower() == "true"
+                process_audio.delay(session, do_asr=enable_asr)
                 break
     except websockets.exceptions.ConnectionClosed:
-        LOG.info("ws closed for session %s", session_id)
+        LOG.info("ws connection closed for session %s", session)
     except Exception:
-        LOG.exception("ws handler error for %s", session_id)
+        LOG.exception("ws handler error for session %s", session)
     finally:
-        LOG.info("cleaning session %s", session_id)
-        try:
-            # optional cleanup
-            pass
-        except Exception:
-            pass
+        # optional cleanup hooks could go here
+        LOG.info("cleanup complete for session %s", session)
 
 if __name__ == "__main__":
     LOG.info("Starting streaming server on %s:%s", HOST, PORT)

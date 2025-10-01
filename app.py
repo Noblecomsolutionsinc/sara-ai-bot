@@ -2,46 +2,56 @@
 import os
 import logging
 import csv
+import json
 from pathlib import Path
 from flask import Flask, request, Response, jsonify, abort
 from twilio.twiml.voice_response import VoiceResponse, Start, Stream
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
 import redis
-import json
 
 from json_loader import sara_store
 
-LOG = logging.getLogger("app")
+# Logging
 logging.basicConfig(level=logging.INFO)
+LOG = logging.getLogger("app")
 
+# App init
 app = Flask(__name__, static_folder="static")
 
-# Env
+# Environment / config
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-SERVER_URL = os.environ.get("SERVER_URL")  # public URL of this Flask app
-PUBLIC_STREAMING_URL = os.environ.get("PUBLIC_STREAMING_URL")  # wss://streaming-host
+SERVER_URL = os.environ.get("SERVER_URL")  # public https://... for TwiML static files
+PUBLIC_STREAMING_URL = os.environ.get("PUBLIC_STREAMING_URL")  # wss://...
 CAMPAIGN_TRIGGER_TOKEN = os.environ.get("CAMPAIGN_TRIGGER_TOKEN", "")
 MP3_RETENTION_HOURS = int(os.environ.get("MP3_RETENTION_HOURS", "48"))
 
+# Redis / Twilio clients
 redis_conn = redis.from_url(REDIS_URL)
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
+twilio_client = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
 validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
 # Redis keys
-CALLMAP_KEY = "sara:callmap:"  # a hash mapping CallSid -> session_id and state
+CALLMAP_KEY = "sara:callmap:"  # hash: CallSid -> session_id
 
-def map_call(call_sid, session_id):
-    redis_conn.hset(CALLMAP_KEY, call_sid, session_id)
-
-def get_session_for_call(call_sid):
-    return redis_conn.hget(CALLMAP_KEY, call_sid)
-
-def respond_403():
-    return abort(403)
+def validate_twilio_request(req):
+    # Validate Twilio request signature when token available; otherwise skip (helpful for testing)
+    if not validator:
+        return True
+    signature = req.headers.get("X-Twilio-Signature", "")
+    url = req.url
+    form = req.form.to_dict()
+    try:
+        return validator.validate(url, form, signature)
+    except Exception:
+        LOG.exception("Twilio request validation failed")
+        return False
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -53,82 +63,104 @@ def health():
         "twilio_configured": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
     })
 
-def validate_twilio_request(req):
-    # Validate signature if possible
-    if not validator:
-        return True
-    url = request.url
-    post_vars = request.form.to_dict()
-    signature = request.headers.get("X-Twilio-Signature", "")
-    return validator.validate(url, post_vars, signature)
-
 @app.route("/outbound", methods=["POST"])
 def outbound():
-    # Twilio webhook when call connects
+    # Twilio webhook when outbound call connects
     if not validate_twilio_request(request):
-        LOG.warning("Invalid Twilio signature")
-        return respond_403()
-    call_sid = request.form.get("CallSid")
+        LOG.warning("Invalid Twilio signature on /outbound")
+        return abort(403)
+    call_sid = request.form.get("CallSid") or request.form.get("CallSid".lower()) or ""
     LOG.info("outbound called by Twilio CallSid=%s", call_sid)
+
     vr = VoiceResponse()
-    # play greeting if exists
+    # Play greeting MP3 if present; fallback to Say
     greeting = Path("static/tts/general_greeting.mp3")
     if greeting.exists():
-        vr.play(f"{SERVER_URL}/static/tts/{greeting.name}")
+        # Use SERVER_URL to serve static file
+        play_url = f"{SERVER_URL}/static/tts/{greeting.name}" if SERVER_URL else f"/static/tts/{greeting.name}"
+        vr.play(play_url)
     else:
-        vr.say(f"Hi, this is {os.getenv('SARA_NAME','Sara')} from {os.getenv('COMPANY_NAME')}. One moment please.", voice="alice")
-    # Start Twilio Media Stream
+        vr.say(f"Hi, this is {os.getenv('SARA_NAME','Sara')} from {os.getenv('COMPANY_NAME','your company')}. One moment please.", voice="alice")
+
+    # Start Twilio Media Stream to the streaming server
     st = Start()
     stream = Stream(url=PUBLIC_STREAMING_URL)
-    # pass callSid to streaming service via parameter
+    # pass callSid so streaming server can correlate
     stream.parameter(name="callSid", value=call_sid)
     st.append(stream)
     vr.append(st)
+
+    # KEEP THE CALL OPEN so worker has time to process and inject TTS
+    # Tune pause length to your expected processing time (60 seconds is a reasonable default)
+    vr.pause(length=60)
+
+    # Fallback message if no TTS injected
+    vr.say("Thanks — we'll follow up with an email shortly.", voice="alice")
+
     return Response(str(vr), mimetype="application/xml")
+
 
 @app.route("/internal/tts_ready", methods=["POST"])
 def tts_ready():
     """
-    Worker -> POST here when MP3 generated.
-    If the call is still active, instruct Twilio to play the MP3 into the call
-    by updating the call's TwiML to a small TwiML that plays the file (via Call.fetch + update).
+    Worker posts here when it creates a TTS mp3.
+    We attempt to find the active Twilio CallSid mapped to the worker's session id and inject TwiML to play the mp3.
     """
     data = request.get_json() or {}
-    call_id = data.get("call_id")  # in our system this is session_id
+    session_id = data.get("call_id")  # our session id (streaming server generated)
     mp3_path = data.get("file")
-    LOG.info("tts_ready callback: session=%s file=%s", call_id, mp3_path)
-    # find Twilio CallSid for the session
-    # we stored callSid->session mapping in Redis at streaming_server start
-    # reverse lookup: scan CALLMAP_KEY
+    LOG.info("tts_ready callback: session=%s file=%s", session_id, mp3_path)
+
+    if not session_id or not mp3_path:
+        return jsonify({"status": "bad_request"}), 400
+
+    # Find CallSid -> session mapping (scan the hash; small cost)
     call_sid = None
-    # Simple approach: iterate hash (small)
-    for k, v in redis_conn.hgetall(CALLMAP_KEY).items():
-        if v.decode() == call_id:
-            call_sid = k.decode()
-            break
+    try:
+        all_map = redis_conn.hgetall(CALLMAP_KEY)
+        for k, v in all_map.items():
+            try:
+                k_dec = k.decode() if isinstance(k, bytes) else str(k)
+                v_dec = v.decode() if isinstance(v, bytes) else str(v)
+                if v_dec == session_id:
+                    call_sid = k_dec
+                    break
+            except Exception:
+                continue
+    except Exception:
+        LOG.exception("Failed to read callmap from Redis")
+
     if not call_sid:
-        LOG.info("No active call found for session %s; skipping live-play", call_id)
+        LOG.info("No active call found for session %s — skipping live-play", session_id)
         return jsonify({"status": "no-active-call"})
-    # create a tiny TwiML to play the MP3 and append hold/return TwiML
+
     if not twilio_client:
         LOG.error("Twilio client not configured; cannot play into active call")
-        return jsonify({"status": "no-twilio"})
+        return jsonify({"status": "twilio-not-configured"}), 500
+
+    # Build absolute URL for mp3
+    if mp3_path.startswith("http://") or mp3_path.startswith("https://"):
+        media_url = mp3_path
+    else:
+        # ensure leading slash removed
+        media_url = f"{SERVER_URL.rstrip('/')}/{mp3_path.lstrip('/')}" if SERVER_URL else mp3_path
+
+    # Create TwiML to play the mp3
+    new_twiml = f"<Response><Play>{media_url}</Play></Response>"
     try:
-        media_url = mp3_path if mp3_path.startswith("http") else f"{SERVER_URL}/{mp3_path.lstrip('/')}"
-        # Update call to fetch new TwiML that plays the file
-        new_twiml = f"<Response><Play>{media_url}</Play></Response>"
+        # Update the live call TwiML so Twilio plays the MP3 into the call
         twilio_client.calls(call_sid).update(twiml=new_twiml)
         LOG.info("Injected TTS into call %s -> %s", call_sid, media_url)
         return jsonify({"status": "ok", "call_sid": call_sid})
     except Exception:
-        LOG.exception("Failed to instruct Twilio to play mp3")
+        LOG.exception("Failed to update Twilio call with TTS")
         return jsonify({"status": "error"}), 500
+
 
 @app.route("/run_campaign", methods=["POST"])
 def run_campaign():
     token = request.args.get("token")
-    secret = CAMPAIGN_TRIGGER_TOKEN
-    if secret and token != secret:
+    if CAMPAIGN_TRIGGER_TOKEN and token != CAMPAIGN_TRIGGER_TOKEN:
         return jsonify({"error": "unauthorized"}), 401
     contacts_file = Path("contacts.csv")
     if not contacts_file.exists():
@@ -149,6 +181,7 @@ def run_campaign():
             out.append({"phone": phone, "error": str(e)})
     return jsonify(out)
 
+
 @app.route("/test_call/<phone>", methods=["GET"])
 def test_call(phone):
     if not twilio_client:
@@ -164,6 +197,7 @@ def test_call(phone):
     except Exception as e:
         LOG.exception("test_call failed")
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
