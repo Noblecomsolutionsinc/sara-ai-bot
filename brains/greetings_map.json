@@ -1,0 +1,7 @@
+{
+  "general": {
+    "greeting": "static/tts\\general_greeting.mp3",
+    "hold": "static/tts\\general_hold.mp3",
+    "booked": "static/tts\\general_booked.mp3"
+  }
+}
