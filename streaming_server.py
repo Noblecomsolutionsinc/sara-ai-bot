@@ -112,6 +112,34 @@ async def handler(ws, path):
 
 if __name__ == "__main__":
     LOG.info("Starting streaming server on %s:%s", HOST, PORT)
-    start_server = websockets.serve(handler, HOST, PORT, max_size=2**20, max_queue=64)
+
+    # Optional small HTTP handler to respond to non-upgrade GET requests (health check).
+    # This prevents Render / other probes from causing "connection rejected (400 Bad Request)" logs.
+    async def process_request(path, request_headers):
+        # If the incoming request is a plain GET to root or /health, return a 200 response
+        # The websockets library will *not* attempt a websocket upgrade in this case.
+        if path in ("/", "/health"):
+            body = b"ok"
+            headers = [
+                ("Content-Type", "text/plain"),
+                ("Content-Length", str(len(body))),
+            ]
+            return 200, headers, body
+        # Returning None means "try to upgrade to a websocket" — do nothing here for other paths
+        return None
+
+    # Accept Twilio's 'twilio' subprotocol explicitly so the handshake succeeds.
+    # We keep reasonable limits for frame size and queue depth.
+    start_server = websockets.serve(
+        handler,
+        HOST,
+        PORT,
+        process_request=process_request,
+        subprotocols=["twilio"],
+        max_size=2**20,
+        max_queue=64,
+    )
+
     asyncio.get_event_loop().run_until_complete(start_server)
     asyncio.get_event_loop().run_forever()
+
