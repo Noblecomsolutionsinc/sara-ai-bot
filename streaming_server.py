@@ -1,88 +1,99 @@
 # streaming_server.py
 import os
 import asyncio
-import websockets
 import json
 import logging
+import uuid
+from collections import deque
 from pathlib import Path
-from elevenlabs import generate, play, set_api_key
 
-# --- Logging setup ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("sara-streaming")
+import websockets
+import redis
+from tasks import process_audio
+from gpt_client import call_gpt
+from json_loader import sara_store
 
-# --- Environment Variables ---
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-MP3_RETENTION_HOURS = int(os.environ.get("MP3_RETENTION_HOURS", 24))
-PUBLIC_STREAMING_URL = os.environ.get("PUBLIC_STREAMING_URL", "wss://sara-ai-streaming.onrender.com/ws")
+LOG = logging.getLogger("streaming_server")
+logging.basicConfig(level=logging.INFO)
 
-if not ELEVENLABS_API_KEY:
-    log.error("ELEVENLABS_API_KEY not set. TTS streaming will fail.")
-set_api_key(ELEVENLABS_API_KEY)
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+redis_conn = redis.from_url(REDIS_URL)
 
-# Load Sara JSONs
-DATA_DIR = Path("data")
-SARA_CALLFLOW = json.loads((DATA_DIR / "Sara_CallFlow.json").read_text(encoding="utf-8"))
-SARA_KNOWLEDGE = json.loads((DATA_DIR / "Sara_KnowledgeBase.json").read_text(encoding="utf-8"))
-SARA_OBJECTIONS = json.loads((DATA_DIR / "Sara_Objections.json").read_text(encoding="utf-8"))
-SARA_OPENING = json.loads((DATA_DIR / "Sara_Opening.json").read_text(encoding="utf-8"))
-SARA_PLAYBOOK = json.loads((DATA_DIR / "Sara_Playbook.json").read_text(encoding="utf-8"))
-SARA_SYSTEM = json.loads((DATA_DIR / "Sara_SystemPrompt_Production.json").read_text(encoding="utf-8"))
+# Render sets PORT env
+PORT = int(os.getenv("PORT", os.getenv("STREAMING_SERVER_PORT", "8765")))
+HOST = "0.0.0.0"
 
-# --- Active streams ---
-active_streams = {}
+AUDIO_LIST_PREFIX = "sara:audio:"  # redis lists
+META_PREFIX = "sara:meta:"
 
-# --- Core async handler ---
-async def handle_stream(websocket, path):
-    """
-    Handles incoming Twilio Media Streams
-    Receives audio frames in base64, processes with TTS and ChatGPT, sends back responses if needed
-    """
-    # Parse query params from path
-    query = {}
-    if "?" in path:
-        qs = path.split("?", 1)[1]
-        query = dict(qc.split("=") for qc in qs.split("&"))
-    business_name = query.get("business_name", "Unknown Business")
-    business_type = query.get("business_type", "general")
+def audio_list_key(session_id):
+    return AUDIO_LIST_PREFIX + session_id
 
-    log.info("New stream connected: %s (%s)", business_name, business_type)
-    stream_id = id(websocket)
-    active_streams[stream_id] = {"name": business_name, "type": business_type}
+def meta_key(session_id):
+    return META_PREFIX + session_id
 
+def set_meta(session_id, data: dict):
+    redis_conn.hset(meta_key(session_id), mapping=data)
+
+async def handler(ws, path):
+    session_id = str(uuid.uuid4())
+    LOG.info("ws connected session %s path %s", session_id, path)
+    buffer = deque(maxlen=600)
     try:
-        async for message in websocket:
+        async for raw in ws:
             try:
-                data = json.loads(message)
-                event = data.get("event")
-                if event == "media":
-                    payload = data.get("media", {})
-                    audio_base64 = payload.get("payload")
-                    # TODO: forward audio to ChatGPT or other processing pipeline
-                    # For now just log receipt
-                    log.info("Received audio frame for %s (%d bytes)", business_name, len(audio_base64 or ""))
-                elif event == "start":
-                    log.info("Stream started: %s", business_name)
-                elif event == "stop":
-                    log.info("Stream stopped: %s", business_name)
-                else:
-                    log.debug("Unknown event: %s", event)
-            except Exception as e:
-                log.exception("Failed to process stream message: %s", e)
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            ev = msg.get("event")
+            if ev == "start":
+                start = msg.get("start", {})
+                call_sid = start.get("callSid") or start.get("sessionId")
+                set_meta(session_id, {"call_sid": call_sid, "started_at": start.get("timestamp", "")})
+                LOG.info("stream start: session=%s call_sid=%s", session_id, call_sid)
+            elif ev == "media":
+                payload = msg.get("media", {}).get("payload")
+                ts = msg.get("timestamp") or ""
+                if payload:
+                    # push base64 chunk into Redis list as JSON
+                    redis_conn.rpush(audio_list_key(session_id), json.dumps({"ts": ts, "b64": payload}))
+                    buffer.append(payload)
+                    # every N frames run a quick intent check
+                    if len(buffer) >= 12:
+                        buffer.clear()
+                        prompt_short = ""
+                        if isinstance(sara_store.system_prompt, dict):
+                            prompt_short = sara_store.system_prompt.get("realtime_short", "") or sara_store.system_prompt.get("text", "")
+                        else:
+                            prompt_short = str(sara_store.system_prompt or "")
+                        # we only provide a placeholder transcript to keep latency down
+                        placeholder = "[short audio segment captured]"
+                        prompt = f"{prompt_short}\nTranscript: {placeholder}\nReturn strict JSON with keys 'intent' and 'action' (action can be 'process_audio' or 'none')."
+                        resp = call_gpt(prompt, max_tokens=48, temperature=0.0)
+                        LOG.info("quick_gpt session=%s resp=%s", session_id, str(resp)[:200])
+                        # Simple heuristic: if model mentions process_audio schedule heavy job
+                        if resp and ("process_audio" in json.dumps(resp).lower() or "summary" in json.dumps(resp).lower()):
+                            process_audio.delay(session_id, do_asr=False)
+                            LOG.info("scheduled process_audio for session %s", session_id)
+            elif ev == "stop":
+                LOG.info("stream stop for session %s", session_id)
+                # schedule final processing
+                process_audio.delay(session_id, do_asr=True if os.environ.get("ENABLE_ASR", "false").lower() == "true" else False)
+                break
     except websockets.exceptions.ConnectionClosed:
-        log.info("Stream closed: %s", business_name)
+        LOG.info("ws closed for session %s", session_id)
+    except Exception:
+        LOG.exception("ws handler error for %s", session_id)
     finally:
-        active_streams.pop(stream_id, None)
-
-# --- WebSocket server ---
-async def main():
-    port = int(os.environ.get("PORT", 8765))
-    server = await websockets.serve(handle_stream, "0.0.0.0", port, ping_interval=30)
-    log.info("Streaming server running on port %d", port)
-    await server.wait_closed()
+        LOG.info("cleaning session %s", session_id)
+        try:
+            # optional cleanup
+            pass
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Shutting down streaming server")
+    LOG.info("Starting streaming server on %s:%s", HOST, PORT)
+    start_server = websockets.serve(handler, HOST, PORT, max_size=2**20, max_queue=64)
+    asyncio.get_event_loop().run_until_complete(start_server)
+    asyncio.get_event_loop().run_forever()
