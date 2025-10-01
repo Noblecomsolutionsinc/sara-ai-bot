@@ -1,7 +1,6 @@
 import os
 import logging
-from openai import OpenAI
-from openai.error import OpenAIError
+from openai import OpenAI, OpenAIError  # Correct import for the latest SDK
 
 # Setup logging
 logging.basicConfig(
@@ -27,10 +26,6 @@ except OpenAIError as e:
 def generate_reply(prompt: str, model: str = "gpt-4.1-mini", max_tokens: int = 500) -> str:
     """
     Generate a text reply using OpenAI GPT.
-    :param prompt: The prompt string to send.
-    :param model: Model to use.
-    :param max_tokens: Maximum tokens to return.
-    :return: Generated text reply.
     """
     try:
         response = client.chat.completions.create(
@@ -38,8 +33,7 @@ def generate_reply(prompt: str, model: str = "gpt-4.1-mini", max_tokens: int = 5
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens
         )
-        reply = response.choices[0].message.content.strip()
-        return reply
+        return response.choices[0].message.content.strip()
     except OpenAIError as e:
         logger.error(f"❌ Error generating reply: {e}")
         return "Error generating reply."
@@ -47,9 +41,6 @@ def generate_reply(prompt: str, model: str = "gpt-4.1-mini", max_tokens: int = 5
 def stream_reply(prompt: str, model: str = "gpt-4o-mini") -> str:
     """
     Stream a reply from GPT for real-time applications.
-    :param prompt: Prompt string.
-    :param model: Model to use.
-    :return: The combined streamed text.
     """
     try:
         streamed_text = ""
