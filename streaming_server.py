@@ -1,106 +1,84 @@
+"""
+streaming_server.py
+Twilio Media Stream <-> GPT+TTS pipeline server
+
+- Accepts WebSocket connections from Twilio Media Streams
+- Routes audio/text via Redis + Celery
+- Exposes /health endpoint for Render health checks
+"""
+
+import os
 import asyncio
+import logging
 import websockets
 import json
-import logging
-import os
-from gpt_client import generate_reply
+from aiohttp import web
 
-# --------------------------------------------------
-# Logging Setup
-# --------------------------------------------------
+# Local imports
+from tasks import handle_twilio_event  # your Celery/Redis event handler
+
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("streaming_server")
 
-# --------------------------------------------------
-# Config
-# --------------------------------------------------
-WS_PORT = 8000
-WS_HOST = "0.0.0.0"
-
-# Retry / Timeout Settings
-RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", 2))
-RETRY_BACKOFF_SECONDS = int(os.getenv("RETRY_BACKOFF_SECONDS", 1))
-OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", 30))
+# --- Config ---
+PORT = int(os.environ.get("PORT", 8765))   # Render provides $PORT, default 8765
+HOST = "0.0.0.0"                           # listen on all interfaces
+WS_PATH = "/ws"
 
 
-# --------------------------------------------------
-# Safe Call to GPT with Retry + Timeout
-# --------------------------------------------------
-async def safe_generate_reply(user_input: str) -> str:
-    last_exception = None
-
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            logger.info(f"🔄 Attempt {attempt}/{RETRY_ATTEMPTS} for GPT call")
-
-            return await asyncio.wait_for(
-                generate_reply(user_input),
-                timeout=OPENAI_TIMEOUT
-            )
-
-        except asyncio.TimeoutError:
-            logger.error(f"⏱️ GPT call timed out (attempt {attempt})")
-            last_exception = "OpenAI API timeout"
-        except Exception as e:
-            logger.error(f"❌ GPT error (attempt {attempt}): {e}")
-            last_exception = str(e)
-
-        if attempt < RETRY_ATTEMPTS:
-            await asyncio.sleep(RETRY_BACKOFF_SECONDS)
-
-    return f"[System Error: {last_exception}]"
-
-
-# --------------------------------------------------
-# WebSocket Client Handler
-# --------------------------------------------------
-async def handler(websocket, path):
-    logger.info(f"✅ Client connected: {websocket.remote_address}")
-
+# --- WebSocket Handler ---
+async def twilio_ws_handler(websocket, path):
+    """
+    Handle Twilio Media Stream WebSocket messages.
+    """
+    logger.info("New WS connection: %s", path)
     try:
         async for message in websocket:
             try:
-                data = json.loads(message)
-                user_input = data.get("text", "").strip()
-
-                if not user_input:
-                    await websocket.send(json.dumps({"error": "Empty input"}))
-                    continue
-
-                logger.info(f"➡️ User said: {user_input}")
-
-                # GPT reply (robust)
-                reply = await safe_generate_reply(user_input)
-
-                logger.info(f"⬅️ Sara reply: {reply}")
-
-                await websocket.send(json.dumps({"reply": reply}))
-
-            except json.JSONDecodeError:
-                logger.warning("⚠️ Invalid JSON from client")
-                await websocket.send(json.dumps({"error": "Invalid JSON format"}))
+                event = json.loads(message)
+                await handle_twilio_event(event, websocket)
             except Exception as e:
-                logger.exception("❌ Error processing message")
+                logger.exception("Error handling Twilio WS message: %s", e)
                 await websocket.send(json.dumps({"error": str(e)}))
+    except websockets.exceptions.ConnectionClosed:
+        logger.info("WS connection closed: %s", path)
+    except Exception as e:
+        logger.exception("Unexpected error in WS handler: %s", e)
 
-    except websockets.exceptions.ConnectionClosed as e:
-        logger.info(f"🔌 Connection closed: {e}")
+
+# --- HTTP Health Endpoint ---
+async def healthcheck(request):
+    return web.json_response({"status": "ok", "service": "streaming_server"})
 
 
-# --------------------------------------------------
-# Server Entry Point
-# --------------------------------------------------
+# --- Main entrypoint ---
 async def main():
-    logger.info(f"🚀 Starting Sara AI WebSocket server on {WS_HOST}:{WS_PORT}")
-    async with websockets.serve(handler, WS_HOST, WS_PORT):
-        await asyncio.Future()  # keep running forever
+    # WebSocket server
+    ws_server = await websockets.serve(
+        twilio_ws_handler, HOST, PORT, ping_interval=20, ping_timeout=20
+    )
+    logger.info("WebSocket server started on ws://%s:%s%s", HOST, PORT, WS_PATH)
+
+    # aiohttp web app for healthcheck
+    app = web.Application()
+    app.router.add_get("/health", healthcheck)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    logger.info("HTTP healthcheck available at http://%s:%s/health", HOST, PORT)
+
+    # Keep running forever
+    await asyncio.Future()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Server stopped manually")
+        logger.info("Shutting down streaming_server...")

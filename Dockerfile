@@ -1,27 +1,28 @@
-# Use official Python slim image
+# --- Base image ---
 FROM python:3.11-slim
 
-# Set working directory
+# --- Environment ---
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8765
+
+# --- Working directory ---
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    ffmpeg \
-    libmagic1 \
+# --- System dependencies ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl libsndfile1 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (better caching)
+# --- Install requirements ---
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# --- Copy app code ---
 COPY . .
 
-# Expose port (Render will map this)
-EXPOSE 5000
+# --- Expose port for Render ---
+EXPOSE ${PORT}
 
-# Default command for Render (can be overridden in render.yaml)
-CMD ["gunicorn", "app:app", "--workers=1", "--threads=2", "--timeout=300"]
+# --- Entrypoint ---
+CMD ["python", "streaming_server.py"]

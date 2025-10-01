@@ -1,0 +1,77 @@
+version: "1"
+
+services:
+  # Flask API (Twilio webhooks, health check, etc.)
+  - type: web
+    name: sara-ai-bot
+    runtime: python
+    repo: https://github.com/Noblecomsolutionsinc/sara-ai-bot
+    plan: standard
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers=1 --threads=2 --timeout=300
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: PUBLIC_STREAMING_URL
+        value: "wss://sara-ai-streaming.onrender.com/ws"
+      - key: TWILIO_MEDIA_WS_URL
+        value: "wss://sara-ai-streaming.onrender.com/ws"
+      - key: REDIS_URL
+        fromService:
+          name: sara-ai-redis
+          type: keyvalue
+          property: connectionString
+
+  # Streaming server (WebSocket + healthcheck)
+  - type: web
+    name: sara-ai-streaming
+    runtime: docker
+    repo: https://github.com/Noblecomsolutionsinc/sara-ai-bot
+    plan: standard
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python streaming_server.py
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          name: sara-ai-redis
+          type: keyvalue
+          property: connectionString
+    healthCheckPath: /health
+
+  # Celery worker
+  - type: worker
+    name: sara-ai-worker
+    runtime: python
+    repo: https://github.com/Noblecomsolutionsinc/sara-ai-bot
+    plan: standard
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A celery_app.celery worker --loglevel=info
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          name: sara-ai-redis
+          type: keyvalue
+          property: connectionString
+
+  # Redis cache
+  - type: keyvalue
+    name: sara-ai-redis
+    plan: starter
+    maxmemoryPolicy: allkeys-lru
