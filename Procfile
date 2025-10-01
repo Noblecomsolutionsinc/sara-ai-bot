@@ -1,3 +1,4 @@
 web: gunicorn app:app --workers=1 --threads=2 --timeout=300
 websocket: python streaming_server.py
-worker: rq worker audio --url $REDIS_URL
+worker: celery -A celery_app.celery worker --loglevel=info
+
