@@ -1,0 +1,20 @@
+[2025-10-01 21:14:59] Testing ws://localhost:8765 | Origin: http://localhost | Token: None
+❌ Connection refused
+💡 Suggestion: Check server is running and port is correct.
+
+[2025-10-01 21:31:23] Testing ws://localhost:8765 | Origin: http://localhost | Token: None
+❌ Connection failed: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+💡 Suggestion: General failure; check server logs, network, and headers.
+
+[2025-10-01 21:34:25] Testing ws://localhost:8765 | Origin: http://localhost | Token: None
+❌ Connection failed: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+💡 Suggestion: General failure; check server logs, network, and headers.
+
+[2025-10-01 21:35:40] Testing ws://localhost:8765 | Origin: http://localhost | Token: None
+❌ Connection failed: BaseEventLoop.create_connection() got an unexpected keyword argument 'extra_headers'
+💡 Suggestion: General failure; check server logs, network, and headers.
+
+[2025-10-01 21:38:40] Testing ws://localhost:8765 | Origin: http://localhost | Token: None
+❌ Connection failed: name 'ws_url' is not defined
+💡 Suggestion: General failure; check server logs, network, and headers.
+

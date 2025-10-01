@@ -1,42 +1,42 @@
 # tasks.py
 import os
 import json
-import tempfile
-import logging
-from pathlib import Path
-from datetime import datetime, timedelta
 import base64
-import subprocess
+import logging
+import tempfile
 import requests
+import subprocess
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from celery_app import celery
 from gpt_client import call_gpt
-from json_loader import sara_store
+from tts_client import text_to_speech
+
 import redis
 
 LOG = logging.getLogger("tasks")
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-redis_conn = redis.from_url(REDIS_URL)
+LOG.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
 
 STATIC_TTS = Path("static/tts")
 STATIC_TTS.mkdir(parents=True, exist_ok=True)
 
-ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-ELEVEN_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "alloy")
-SERVER_URL = os.environ.get("SERVER_URL")  # callback target
-MP3_RETENTION_HOURS = int(os.environ.get("MP3_RETENTION_HOURS", "48"))
+SERVER_URL = os.getenv("SERVER_URL")  # used by callback /internal/tts_ready
+MP3_RETENTION_HOURS = int(os.getenv("MP3_RETENTION_HOURS", "48"))
 
-# Redis key helpers
-def audio_list_key(session_id):
+def audio_list_key(session_id: str) -> str:
     return f"sara:audio:{session_id}"
 
-def meta_key(session_id):
+def meta_key(session_id: str) -> str:
     return f"sara:meta:{session_id}"
 
-def push_meta(session_id, k, v):
-    redis_conn.hset(meta_key(session_id), k, v)
+def result_key(session_id: str) -> str:
+    return f"sara:result:{session_id}"
 
-def pop_audio_chunks(session_id, max_chunks=2000):
+def pop_audio_chunks(session_id: str, max_chunks: int = 2000):
     key = audio_list_key(session_id)
     chunks = []
     for _ in range(max_chunks):
@@ -85,8 +85,8 @@ def convert_raw_to_wav(raw_path):
         except Exception:
             pass
 
-def call_whisper(wav_path):
-    OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+def call_whisper(wav_path: str) -> str:
+    OPENAI_KEY = os.getenv("OPENAI_API_KEY")
     if not OPENAI_KEY:
         LOG.error("OpenAI key missing for ASR")
         return ""
@@ -103,113 +103,92 @@ def call_whisper(wav_path):
         LOG.exception("Whisper call failed")
         return ""
 
-def eleven_generate(text, call_id, voice=None, retries=2):
-    if not ELEVEN_API_KEY:
-        LOG.error("ElevenLabs API key not set")
-        return None
-    voice = voice or ELEVEN_VOICE_ID
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice}"
-    headers = {"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"}
-    payload = {"text": text, "voice_settings": {"stability": 0.6, "similarity_boost": 0.6}}
-    backoff = 1.0
-    out_name = f"{call_id}_{int(datetime.utcnow().timestamp())}.mp3"
-    out_path = STATIC_TTS / out_name
-    for attempt in range(retries + 1):
-        try:
-            r = requests.post(url, headers=headers, json=payload, stream=True, timeout=120)
-            r.raise_for_status()
-            with open(out_path, "wb") as fh:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        fh.write(chunk)
-            LOG.info("Generated TTS: %s", out_path)
-            return str(out_path)
-        except Exception as e:
-            LOG.warning("ElevenLabs attempt %d failed: %s", attempt + 1, e)
-            if attempt < retries:
-                import time; time.sleep(backoff); backoff *= 2
-            else:
-                LOG.exception("ElevenLabs final failure")
-                return None
-
 @celery.task(bind=True, name="tasks.generate_tts")
-def generate_tts(self, call_id, text, voice=None):
-    LOG.info("generate_tts called for %s", call_id)
-    path = eleven_generate(text, call_id, voice=voice)
+def generate_tts(self, session_id: str, text: str, voice: str = None):
+    LOG.info("generate_tts called for session=%s", session_id)
+    path = text_to_speech(text, voice=voice, call_id=session_id)
     if path:
-        # log and optionally callback
+        # store result
+        try:
+            redis_conn.hset(result_key(session_id), mapping={"tts_path": path, "tts_generated_at": datetime.utcnow().isoformat()})
+        except Exception:
+            LOG.exception("Failed to store tts path in redis for %s", session_id)
+
+        # callback to app so it can inject TwiML / Play the MP3 into active call
         try:
             if SERVER_URL:
-                requests.post(f"{SERVER_URL}/internal/tts_ready", json={"call_id": call_id, "file": path}, timeout=8)
+                requests.post(f"{SERVER_URL.rstrip('/')}/internal/tts_ready", json={"call_id": session_id, "file": path}, timeout=8)
         except Exception:
-            LOG.exception("Callback to app failed")
-        # schedule cleanup meta
-        push_meta(call_id, "last_tts", path)
+            LOG.exception("Callback to app /internal/tts_ready failed")
         return {"status": "ok", "file": path}
     return {"status": "error"}
 
 @celery.task(bind=True, name="tasks.process_audio")
-def process_audio(self, session_id, do_asr=False):
-    LOG.info("process_audio session %s asr=%s", session_id, do_asr)
+def process_audio(self, session_id: str, do_asr: bool = True):
+    LOG.info("process_audio started for session=%s (ASR=%s)", session_id, do_asr)
     chunks = pop_audio_chunks(session_id, max_chunks=8000)
     if not chunks:
-        LOG.info("No audio data for %s", session_id)
+        LOG.info("No audio chunks for session %s", session_id)
         return {"status": "empty"}
+
+    # write raw PCM then convert to wav if ASR requested
     raw = write_raw_file(chunks)
-    wav = None
-    transcript = "[no-asr]"
-    try:
-        if do_asr:
+    transcript = ""
+    if do_asr:
+        try:
             wav = convert_raw_to_wav(raw)
             if wav:
-                transcript = call_whisper(wav) or transcript
+                transcript = call_whisper(wav) or ""
+        except Exception:
+            LOG.exception("ASR flow failed for session %s", session_id)
+            transcript = ""
+    else:
+        # fast fallback summary
+        transcript = "[short audio captured - no ASR]"
+
+    # GPT processing
+    try:
+        sys_prompt = ""
+        # try to grab safe system prompt from store if available
+        try:
+            if hasattr(sara_store := __import__("json_loader").json_loader.sara_store, "system_prompt"):
+                sp = sara_store.system_prompt
+                if isinstance(sp, dict):
+                    sys_prompt = sp.get("text", "") or sp.get("realtime_short", "") or ""
+                else:
+                    sys_prompt = str(sp or "")
+        except Exception:
+            sys_prompt = ""
+
+        prompt = f"{sys_prompt}\n\nTranscript: {transcript}\n\nReturn strict JSON with keys: intent, summary, action_text."
+        gpt_out = call_gpt(prompt, max_completion_tokens=512, temperature=0.2)
+        try:
+            gpt_result = json.loads(gpt_out) if isinstance(gpt_out, str) else gpt_out or {}
+        except Exception:
+            gpt_result = {"raw": str(gpt_out)}
     except Exception:
-        LOG.exception("ASR flow failed; defaulting transcript")
-    # Compose GPT prompt
-    sys_prompt = ""
-    if isinstance(sara_store.system_prompt, dict):
-        sys_prompt = sara_store.system_prompt.get("text", "")
-    elif sara_store.system_prompt:
-        sys_prompt = str(sara_store.system_prompt)
-    kb = sara_store.knowledge if sara_store.knowledge else {}
-    prompt = f"{sys_prompt}\n\nKnowledge excerpt: {json.dumps(kb)[:4000]}\n\nTranscript: {transcript}\n\nReturn strict JSON with keys: outcome, confidence, disposition_text, followup_email."
-    gpt_out = call_gpt(prompt, max_tokens=512, temperature=0.2)
-    push_meta(session_id, "last_processed", json.dumps(gpt_out or {}))
-    # If GPT suggests speaking, create TTS
+        LOG.exception("GPT processing failed for session %s", session_id)
+        gpt_result = {"error": "gpt_failed"}
+
+    # store metadata & gpt_result
+    try:
+        redis_conn.hset(meta_key(session_id), mapping={"transcript": transcript, "gpt_result": json.dumps(gpt_result)})
+        redis_conn.hset(result_key(session_id), mapping={"gpt_result": json.dumps(gpt_result)})
+    except Exception:
+        LOG.exception("Failed to store meta/result for session %s", session_id)
+
+    # generate TTS if GPT provided text
     disposition_text = ""
     try:
-        if isinstance(gpt_out, dict):
-            # try to find text in common fields
-            if "output_text" in gpt_out:
-                disposition_text = gpt_out["output_text"]
-            elif "output" in gpt_out and isinstance(gpt_out["output"], list):
-                # join textual content
-                parts = []
-                for o in gpt_out["output"]:
-                    if isinstance(o, dict):
-                        parts.append(str(o.get("content", "")))
-                    else:
-                        parts.append(str(o))
-                disposition_text = " ".join(parts)
-            else:
-                disposition_text = json.dumps(gpt_out)[:1000]
+        if isinstance(gpt_result, dict):
+            disposition_text = gpt_result.get("summary") or gpt_result.get("action_text") or gpt_result.get("output_text") or ""
+        elif isinstance(gpt_result, str):
+            disposition_text = gpt_result
     except Exception:
-        LOG.exception("parsing gpt_out failed")
+        LOG.exception("parsing gpt_result failed")
+
     if disposition_text:
         generate_tts.delay(session_id, disposition_text)
-    return {"status": "processed", "gpt": gpt_out}
 
-@celery.task(bind=True, name="tasks.cleanup_mp3s")
-def cleanup_mp3s(self):
-    cutoff = datetime.utcnow() - timedelta(hours=MP3_RETENTION_HOURS)
-    removed = 0
-    for f in STATIC_TTS.glob("*.mp3"):
-        try:
-            mtime = datetime.utcfromtimestamp(f.stat().st_mtime)
-            if mtime < cutoff:
-                f.unlink()
-                removed += 1
-        except Exception:
-            continue
-    LOG.info("cleanup_mp3s removed %d files older than %s", removed, cutoff.isoformat())
-    return {"removed": removed}
+    LOG.info("process_audio completed for session %s", session_id)
+    return {"status": "processed", "gpt_result": gpt_result}

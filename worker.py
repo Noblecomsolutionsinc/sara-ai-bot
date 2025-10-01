@@ -1,84 +1,63 @@
 # worker.py
 import os
 import logging
-import time
 import json
-from rq import Queue, Worker
-from redis import Redis
 from pathlib import Path
-from elevenlabs import generate, set_api_key
+import requests
+from datetime import datetime
 
-# --- Logging ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("sara-worker")
+STATIC_TTS = Path("static/tts")
+STATIC_TTS.mkdir(parents=True, exist_ok=True)
 
-# --- Environment ---
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-MP3_RETENTION_HOURS = int(os.environ.get("MP3_RETENTION_HOURS", 24))
-QUEUE_NAME = os.environ.get("QUEUE_NAME", "audio")
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+SERVER_URL = os.getenv("SERVER_URL")  # to callback /internal/tts_ready
 
-if not ELEVENLABS_API_KEY:
-    log.warning("ELEVENLABS_API_KEY not set; TTS tasks will fail")
-else:
-    set_api_key(ELEVENLABS_API_KEY)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("worker")
 
-# --- Redis queue setup ---
-redis_conn = Redis.from_url(REDIS_URL)
-q = Queue(QUEUE_NAME, connection=redis_conn)
-
-# --- Load Sara JSONs for context ---
-DATA_DIR = Path("data")
-SARA_CALLFLOW = json.loads((DATA_DIR / "Sara_CallFlow.json").read_text(encoding="utf-8"))
-SARA_KNOWLEDGE = json.loads((DATA_DIR / "Sara_KnowledgeBase.json").read_text(encoding="utf-8"))
-SARA_OBJECTIONS = json.loads((DATA_DIR / "Sara_Objections.json").read_text(encoding="utf-8"))
-SARA_OPENING = json.loads((DATA_DIR / "Sara_Opening.json").read_text(encoding="utf-8"))
-SARA_PLAYBOOK = json.loads((DATA_DIR / "Sara_Playbook.json").read_text(encoding="utf-8"))
-SARA_SYSTEM = json.loads((DATA_DIR / "Sara_SystemPrompt_Production.json").read_text(encoding="utf-8"))
-
-# --- Tasks ---
-def generate_tts(text: str, filename: str):
+def elevenlabs_tts(text, filename, voice_id=None):
     """
-    Generate TTS using ElevenLabs and save locally under static/tts
+    Minimal ElevenLabs HTTP call. Replace voice_id with your voice.
     """
-    from pathlib import Path
-    output_dir = Path("static/tts")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    filepath = output_dir / f"{filename}.mp3"
-    log.info("Generating TTS for: %s -> %s", text[:60], filepath)
+    if not ELEVEN_API_KEY:
+        logger.error("No ElevenLabs key set")
+        return False
+    voice = voice_id or os.getenv("ELEVENLABS_VOICE_ID", "alloy")
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice}"
+    headers = {"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"}
+    payload = {"text": text}
     try:
-        audio = generate(text=text, voice="alloy", model="eleven_monolingual_v1")
-        with open(filepath, "wb") as f:
-            f.write(audio)
-        log.info("TTS saved: %s", filepath)
-        return str(filepath)
+        r = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
+        r.raise_for_status()
+        with open(filename, "wb") as fh:
+            for chunk in r.iter_content(1024):
+                fh.write(chunk)
+        return True
     except Exception as e:
-        log.exception("Failed to generate TTS: %s", e)
-        return None
+        logger.exception("ElevenLabs TTS error: %s", e)
+        return False
 
-def process_call_audio(call_id: str, audio_base64: str):
+def process_task(payload):
     """
-    Background task to process an incoming audio chunk
+    Called by RQ worker. Example payload:
+    {"type":"generate_tts","call_id":"...","text":"..."}
     """
-    log.info("Processing audio for call_id=%s, bytes=%d", call_id, len(audio_base64 or ""))
-    # TODO: Send to ChatGPT or other NLP pipeline
-    time.sleep(0.2)  # simulate processing
-
-def enqueue_tts(text: str, filename: str):
-    """
-    Enqueue TTS generation task
-    """
-    log.info("Enqueue TTS task for %s", filename)
-    q.enqueue(generate_tts, text, filename)
-
-def enqueue_audio_processing(call_id: str, audio_base64: str):
-    """
-    Enqueue audio processing task
-    """
-    q.enqueue(process_call_audio, call_id, audio_base64)
-
-# --- Worker runner ---
-if __name__ == "__main__":
-    log.info("Starting RQ worker on queue '%s' with Redis %s", QUEUE_NAME, REDIS_URL)
-    worker = Worker([q], connection=redis_conn)
-    worker.work()
+    task_type = payload.get("type")
+    call_id = payload.get("call_id")
+    logger.info("Worker processing task_type=%s call_id=%s", task_type, call_id)
+    if task_type == "generate_tts":
+        text = payload.get("text", "Hello from Sara AI")
+        fname = STATIC_TTS / f"{call_id}_{int(datetime.utcnow().timestamp())}.mp3"
+        ok = elevenlabs_tts(text, str(fname))
+        if ok:
+            logger.info("TTS saved: %s", fname)
+            # notify Flask app that a tts file exists
+            if SERVER_URL:
+                try:
+                    requests.post(f"{SERVER_URL}/internal/tts_ready", json={"call_id": call_id, "file": str(fname)}, timeout=10)
+                except Exception:
+                    logger.exception("Callback to app failed")
+        else:
+            logger.error("TTS generation failed for call %s", call_id)
+    else:
+        logger.warning("Unknown task type: %s", task_type)

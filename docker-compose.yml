@@ -1,0 +1,53 @@
+version: "3.8"
+services:
+  redis:
+    image: redis:7
+    container_name: sara-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  web:
+    build: .
+    container_name: sara-web
+    command: >
+      sh -lc "gunicorn app:app --bind 0.0.0.0:5000 --workers 1 --threads 2 --timeout 300"
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+      - SERVER_URL=http://localhost:5000
+      - PUBLIC_STREAMING_URL=ws://localhost:8765
+    depends_on:
+      - redis
+
+  stream:
+    build: .
+    container_name: sara-stream
+    command: sh -lc "python streaming_server.py"
+    ports:
+      - "8765:8765"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      - redis
+
+  worker:
+    build: .
+    container_name: sara-worker
+    command: sh -lc "celery -A celery_app.celery worker --loglevel=info --concurrency=1"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - SERVER_URL=http://localhost:5000
+    depends_on:
+      - redis
