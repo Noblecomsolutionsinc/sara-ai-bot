@@ -1,20 +1,44 @@
 import json
 import logging
-import os
 from datetime import datetime
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL)
+"""
+Schema fields:
+- timestamp: ISO8601 UTC
+- service: component name (e.g., tts_server)
+- event: short event tag
+- status: success|failure|pending
+- message: descriptive text
+- level: INFO|WARNING|ERROR
+- extra: optional JSON metadata
+"""
 
-def log_event(service: str, event: str, status: str, message: str, extra: dict = None):
-    log = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "service": service,
-        "event": event,
-        "status": status,
-        "message": message,
-    }
-    if extra and LOG_LEVEL == "DEBUG":
-        log.update(extra)
+def log_event(service, event, status, message, level="INFO", extra=None):
+    try:
+        log_record = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "service": service,
+            "event": event,
+            "status": status,
+            "message": message,
+            "level": level.upper(),
+            "extra": extra if isinstance(extra, dict) else {}
+        }
+        line = json.dumps(log_record, ensure_ascii=False)
 
-    print(json.dumps(log))
+    except Exception as e:
+        # Fallback if serialization fails
+        line = json.dumps({
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "service": "logging_utils",
+            "event": "serialization_error",
+            "status": "failure",
+            "message": f"Failed to serialize log: {e}",
+            "level": "ERROR",
+            "extra": {}
+        })
+
+    # Map level string to logging function
+    level_upper = level.upper()
+    logger_func = getattr(logging, level_upper.lower(), logging.info)
+    logger_func(line)
