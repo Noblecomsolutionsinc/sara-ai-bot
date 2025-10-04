@@ -1,63 +1,32 @@
 import os
 import logging
+import sentry_sdk
+from dotenv import load_dotenv
 
-try:
-    import sentry_sdk
-except ImportError:
-    sentry_sdk = None
+# Load environment variables from .env
+load_dotenv()
 
-
-def init_sentry(service_name: str = "sara_ai"):
-    """
-    Initialize Sentry error tracking if DSN is available.
-    Logs either 'success' or 'skipped' via root logger.
-    """
-    logger = logging.getLogger()
-
-    dsn = os.getenv("SENTRY_DSN", "").strip()
-
+def init_sentry():
+    dsn = os.getenv("SENTRY_DSN")
     if not dsn:
-        logger.info(
-            {
-                "service": "sentry",
-                "event": "init",
-                "status": "skipped",
-                "message": "SENTRY_DSN not set; skipping initialization",
-            }
-        )
-        return
-
-    if sentry_sdk is None:
-        logger.warning(
-            {
-                "service": "sentry",
-                "event": "init",
-                "status": "failed",
-                "message": "sentry_sdk not installed; cannot initialize",
-            }
+        logging.info(
+            '{"service": "sentry", "event": "init", "status": "skipped", '
+            '"message": "SENTRY_DSN not set; skipping initialization"}'
         )
         return
 
     try:
         sentry_sdk.init(
             dsn=dsn,
-            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "1.0")),
-            environment=os.getenv("SARA_ENV", "development"),
+            traces_sample_rate=1.0,
+            enable_tracing=True,
         )
-        logger.info(
-            {
-                "service": "sentry",
-                "event": "init",
-                "status": "success",
-                "message": f"Sentry initialized for service={service_name}",
-            }
+        logging.info(
+            '{"service": "sentry", "event": "init", "status": "success", '
+            '"message": "Sentry initialized successfully"}'
         )
     except Exception as e:
-        logger.error(
-            {
-                "service": "sentry",
-                "event": "init",
-                "status": "error",
-                "message": f"Sentry initialization failed: {e}",
-            }
+        logging.error(
+            f'{{"service": "sentry", "event": "init", "status": "error", '
+            f'"message": "Failed to initialize Sentry: {str(e)}"}}'
         )
