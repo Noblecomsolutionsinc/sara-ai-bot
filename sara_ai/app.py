@@ -1,33 +1,20 @@
-from flask import Flask, request, jsonify
+import os
+import logging
+from flask import Flask, jsonify
 from sara_ai.logging_utils import log_event
-from sara_ai.celery_app import celery
-from sara_ai.tasks import process_event
+from sara_ai.sentry_utils import init_sentry
+
+# Initialize Sentry (safe no-op if DSN missing)
+init_sentry()
 
 app = Flask(__name__)
 
-# Startup log
-log_event(
-    service="flask_app",
-    event="startup",
-    status="success",
-    message="Flask app started successfully",
-)
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-@app.route("/inference", methods=["POST"])
-def inference():
-    payload = request.get_json(force=True)
-    task = process_event.delay(payload)
-    return jsonify({"task_id": task.id}), 202
-
-@app.route("/tts", methods=["POST"])
-def tts():
-    payload = request.get_json(force=True)
-    task = process_event.delay(payload)
-    return jsonify({"task_id": task.id}), 202
+@app.route("/")
+def index():
+    log_event(service="app", event="startup", status="ok", message="Flask app running")
+    return jsonify({"status": "ok", "service": "app"})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", 5000))
+    log_event(service="app", event="run", status="starting", message=f"Listening on port {port}")
+    app.run(host="0.0.0.0", port=port)

@@ -1,25 +1,21 @@
+import os
 from flask import Flask, request, jsonify
-from sara_ai.tasks import process_event
 from sara_ai.logging_utils import log_event
+from sara_ai.sentry_utils import init_sentry
+
+# Initialize Sentry
+init_sentry()
 
 app = Flask(__name__)
 
-log_event(
-    service="tts_server",
-    event="startup",
-    status="success",
-    message="TTS server started successfully",
-)
-
 @app.route("/tts", methods=["POST"])
 def tts():
-    payload = request.get_json(force=True)
-    task = process_event.delay(payload)
-    return jsonify({"task_id": task.id}), 202
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
+    data = request.json
+    text = data.get("text", "")
+    log_event(service="tts_server", event="tts_request", status="ok", message=f"Received text: {text[:30]}...")
+    return jsonify({"audio_url": f"/static/audio/{hash(text)}.mp3"})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=7000)
+    port = int(os.getenv("TTS_PORT", 6000))
+    log_event(service="tts_server", event="startup", status="ok", message=f"Listening on {port}")
+    app.run(host="0.0.0.0", port=port)
