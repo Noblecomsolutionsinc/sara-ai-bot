@@ -1,34 +1,34 @@
-# Multi-stage Dockerfile (builder + runtime)
-FROM python:3.11-slim AS builder
+# ---- Base Image ----
+FROM python:3.11-slim as base
+
+# Set working directory
 WORKDIR /app
 
-# Install build deps
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential gcc curl git && rm -rf /var/lib/apt/lists/*
+# Install system dependencies (for eventlet, psycopg2, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
+# ---- Install Python dependencies ----
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip setuptools wheel
-RUN python -m pip install --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Runtime image
-FROM python:3.11-slim
-WORKDIR /app
+# ---- Copy project ----
+COPY . .
 
-# Add runtime deps (ffmpeg)
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
+# Default environment variables
+ENV ENV_MODE=render \
+    SERVICE_TYPE=app \
+    PYTHONUNBUFFERED=1
 
-# Add non-root user
-RUN useradd --create-home --shell /bin/bash appuser
-USER appuser
-
-# Copy installed packages from builder
-COPY --from=builder /install /usr/local
-# Copy application code
-COPY --chown=appuser:appuser . .
-
-ENV PYTHONUNBUFFERED=1
-ENV LOG_LEVEL=INFO
-
-EXPOSE 5000 8765
-
-# Default command is to run web; docker-compose overrides for other services
-CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app", "--workers=2", "--log-level=info"]
+# ---- Entrypoint ----
+# Multi-service support: app (Flask API), worker (Celery), streaming (Twilio/WS)
+CMD if [ "$SERVICE_TYPE" = "worker" ]; then \
+      celery -A sara_ai.celery_app.celery worker --loglevel=INFO; \
+    elif [ "$SERVICE_TYPE" = "streaming" ]; then \
+      gunicorn -b 0.0.0.0:6000 -k eventlet sara_ai.streaming_server:app; \
+    else \
+      gunicorn -b 0.0.0.0:5000 sara_ai.app:app; \
+    fi
