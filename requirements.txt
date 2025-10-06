@@ -10,5 +10,5 @@ ffmpeg-python==0.2.0
 openai==1.40.6
 twilio==9.8.0
 python-magic==0.4.27
-sentry-sdk==2.19.0
+sentry-sdk==2.0.0
 websockets==12.0
