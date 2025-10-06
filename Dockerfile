@@ -13,15 +13,15 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip
 RUN pip install --upgrade pip
 
-# Install dependencies from requirements.txt
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
 
-# Expose default Flask port
+# Expose default port
 EXPOSE 5000
 
-# Production entrypoint for Flask app
-CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "sara_ai.app:app"]
+# Start the Flask API with Gunicorn + UvicornWorker
+CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "sara_ai.app:app", "--bind", "0.0.0.0:5000"]
