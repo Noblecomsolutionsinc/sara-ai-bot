@@ -1,44 +1,29 @@
-import json
 import logging
+import json
+import uuid
 from datetime import datetime
 
-"""
-Schema fields:
-- timestamp: ISO8601 UTC
-- service: component name (e.g., tts_server)
-- event: short event tag
-- status: success|failure|pending
-- message: descriptive text
-- level: INFO|WARNING|ERROR
-- extra: optional JSON metadata
-"""
+def log_event(service, event, status, message="", level="INFO", extra=None, trace_id=None):
+    if trace_id is None:
+        trace_id = str(uuid.uuid4())
 
-def log_event(service, event, status, message, level="INFO", extra=None):
-    try:
-        log_record = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "service": service,
-            "event": event,
-            "status": status,
-            "message": message,
-            "level": level.upper(),
-            "extra": extra if isinstance(extra, dict) else {}
-        }
-        line = json.dumps(log_record, ensure_ascii=False)
+    payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "service": service,
+        "event": event,
+        "status": status,
+        "message": message,
+        "level": level,
+        "trace_id": trace_id,
+        "extra": extra or {}
+    }
 
-    except Exception as e:
-        # Fallback if serialization fails
-        line = json.dumps({
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "service": "logging_utils",
-            "event": "serialization_error",
-            "status": "failure",
-            "message": f"Failed to serialize log: {e}",
-            "level": "ERROR",
-            "extra": {}
-        })
+    log_line = json.dumps(payload)
+    if level.upper() == "ERROR":
+        logging.error(log_line)
+    elif level.upper() == "WARNING":
+        logging.warning(log_line)
+    else:
+        logging.info(log_line)
 
-    # Map level string to logging function
-    level_upper = level.upper()
-    logger_func = getattr(logging, level_upper.lower(), logging.info)
-    logger_func(line)
+    return trace_id
