@@ -1,20 +1,20 @@
-import os
 import logging
-from flask import Flask, jsonify
-from sara_ai.logging_utils import log_event
-from sara_ai.sentry_utils import init_sentry
-
-# Initialize Sentry (safe no-op if DSN missing)
-init_sentry()
+from flask import Flask, jsonify, request
+from sara_ai.tasks import process_event
 
 app = Flask(__name__)
+logger = logging.getLogger("flask_app")
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def index():
-    log_event(service="app", event="startup", status="ok", message="Flask app running")
-    return jsonify({"status": "ok", "service": "app"})
+    return jsonify({"service": "Sara AI Flask API", "status": "running"})
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    log_event(service="app", event="run", status="starting", message=f"Listening on port {port}")
-    app.run(host="0.0.0.0", port=port)
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy", "service": "flask_app"})
+
+@app.route("/inference", methods=["POST"])
+def inference():
+    data = request.json or {}
+    task = process_event.delay(data)
+    return jsonify({"task_id": task.id, "status": "submitted"})

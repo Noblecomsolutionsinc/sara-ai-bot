@@ -1,34 +1,27 @@
-# ---- Base Image ----
-FROM python:3.11-slim as base
+# Use slim Python base
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies (for eventlet, psycopg2, etc.)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
     build-essential \
-    gcc \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- Install Python dependencies ----
+# Upgrade pip
+RUN pip install --upgrade pip
+
+# Install dependencies from requirements.txt
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Copy project ----
+# Copy application code
 COPY . .
 
-# Default environment variables
-ENV ENV_MODE=render \
-    SERVICE_TYPE=app \
-    PYTHONUNBUFFERED=1
+# Expose default Flask port
+EXPOSE 5000
 
-# ---- Entrypoint ----
-# Multi-service support: app (Flask API), worker (Celery), streaming (Twilio/WS)
-CMD if [ "$SERVICE_TYPE" = "worker" ]; then \
-      celery -A sara_ai.celery_app.celery worker --loglevel=INFO; \
-    elif [ "$SERVICE_TYPE" = "streaming" ]; then \
-      gunicorn -b 0.0.0.0:6000 -k eventlet sara_ai.streaming_server:app; \
-    else \
-      gunicorn -b 0.0.0.0:5000 sara_ai.app:app; \
-    fi
+# Production entrypoint for Flask app
+CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "sara_ai.app:app"]

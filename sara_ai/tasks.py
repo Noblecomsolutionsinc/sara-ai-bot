@@ -1,34 +1,21 @@
-from sara_ai.celery_app import celery
-from sara_ai.logging_utils import log_event
+import logging
+from sara_ai.celery_app import celery_app
+from sara_ai.gpt_client import generate_reply
 
-@celery.task(name="tasks.process_event")
-def process_event(payload: dict) -> dict:
+logger = logging.getLogger("tasks")
+
+@celery_app.task(name="process_event")
+def process_event(event: dict) -> dict:
+    """
+    Celery task to process incoming event and generate GPT reply.
+    """
     try:
-        log_event(
-            service="tasks",
-            event="process_event",
-            status="started",
-            message="Processing event",
-            extra={"payload": payload},
-        )
+        prompt = event.get("prompt", "")
+        task_id = process_event.request.id
+        logger.info(f"Task {task_id} started with prompt length={len(prompt)}")
 
-        # Placeholder business logic
-        result = {"status": "ok", "echo": payload}
-
-        log_event(
-            service="tasks",
-            event="process_event",
-            status="success",
-            message="Event processed successfully",
-            extra={"result": result},
-        )
-        return result
-
+        reply = generate_reply(prompt)
+        return {"status": "ok", "reply": reply}
     except Exception as e:
-        log_event(
-            service="tasks",
-            event="process_event",
-            status="error",
-            message=str(e),
-        )
-        raise
+        logger.error(f"Task failed: {e}")
+        return {"status": "error", "message": str(e)}
