@@ -1,77 +1,36 @@
-version: "1"
-
 services:
-  # Flask API (Twilio webhooks, health check, etc.)
   - type: web
-    name: sara-ai-bot
-    runtime: python
-    repo: https://github.com/Noblecomsolutionsinc/sara-ai-bot
-    plan: standard
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers=1 --threads=2 --timeout=300
+    name: sara-ai-api
+    env: python
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker sara_ai.app:app --bind 0.0.0.0:$PORT --timeout 120
     envVars:
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: ELEVENLABS_API_KEY
-        sync: false
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_PHONE_NUMBER
-        sync: false
-      - key: PUBLIC_STREAMING_URL
-        value: "wss://sara-ai-streaming.onrender.com/ws"
-      - key: TWILIO_MEDIA_WS_URL
-        value: "wss://sara-ai-streaming.onrender.com/ws"
       - key: REDIS_URL
-        fromService:
-          name: sara-ai-redis
-          type: keyvalue
-          property: connectionString
-
-  # Streaming server (WebSocket + healthcheck)
-  - type: web
-    name: sara-ai-streaming
-    runtime: docker
-    repo: https://github.com/Noblecomsolutionsinc/sara-ai-bot
-    plan: standard
-    dockerContext: .
-    dockerfilePath: ./Dockerfile
-    dockerCommand: python streaming_server.py
-    envVars:
-      - key: OPENAI_API_KEY
+        value: redis://sara-ai-redis:6379/0
+      - key: SENTRY_DSN
         sync: false
-      - key: ELEVENLABS_API_KEY
-        sync: false
-      - key: REDIS_URL
-        fromService:
-          name: sara-ai-redis
-          type: keyvalue
-          property: connectionString
-    healthCheckPath: /health
+      - key: ENVIRONMENT
+        value: production
 
-  # Celery worker
   - type: worker
     name: sara-ai-worker
-    runtime: python
-    repo: https://github.com/Noblecomsolutionsinc/sara-ai-bot
-    plan: standard
-    buildCommand: pip install -r requirements.txt
-    startCommand: celery -A celery_app.celery worker --loglevel=info
+    env: python
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: celery -A sara_ai.celery_app.celery worker --pool=solo --loglevel=info
     envVars:
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: ELEVENLABS_API_KEY
-        sync: false
       - key: REDIS_URL
-        fromService:
-          name: sara-ai-redis
-          type: keyvalue
-          property: connectionString
+        value: redis://sara-ai-redis:6379/0
+      - key: SENTRY_DSN
+        sync: false
+      - key: ENVIRONMENT
+        value: production
 
-  # Redis cache
-  - type: keyvalue
-    name: sara-ai-redis
-    plan: starter
-    maxmemoryPolicy: allkeys-lru
+databases:
+  - name: sara-ai-redis
+    plan: free
+    region: oregon
