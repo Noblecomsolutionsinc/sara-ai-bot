@@ -1,63 +1,53 @@
 """
-Celery Application Configuration for Sara AI
---------------------------------------------
-This module configures the Celery app used for background task processing.
-It integrates Sentry for error tracking, structured logging with trace IDs,
-and platform-specific settings for Windows (solo pool).
+celery_app.py
+Central Celery configuration for Sara AI.
+Ensures consistent startup, Redis connectivity, and structured logging.
 """
 
+from __future__ import annotations
+
 import os
-import platform
+import logging
 from celery import Celery
 from sara_ai.logging_utils import log_event
-from sara_ai.sentry_utils import init_sentry
 
+# ---------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------
+BROKER_URL = os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL") or "redis://localhost:6379/0"
+RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND") or BROKER_URL
 
-# --- Platform Compatibility ---
-# Auto-adjust for Windows to avoid multiprocessing fork issues
-if platform.system() == "Windows":
-    os.environ.setdefault("FORKED_BY_MULTIPROCESSING", "1")
-    os.environ.setdefault("CELERYD_POOL", "solo")
-
-
-# --- Broker Configuration ---
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
-# Initialize Celery
-celery = Celery("sara_ai", broker=REDIS_URL, backend=REDIS_URL)
-
-# Observability
-init_sentry()
-trace_id = log_event(
-    service="celery",
-    event="startup",
-    status="ok",
-    message=f"Celery initialized with broker={REDIS_URL}",
+# ---------------------------------------------------------------------
+# Celery Application
+# ---------------------------------------------------------------------
+celery_app = Celery(
+    "sara_ai",
+    broker=BROKER_URL,
+    backend=RESULT_BACKEND,
 )
 
-# Example task (for test & healthcheck)
-@celery.task(name="example_task")
-def example_task(data, trace_id=None):
-    trace_id = log_event(
-        service="celery",
-        event="task_start",
-        status="ok",
-        message=f"Task received: {data}",
-        trace_id=trace_id,
-    )
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    enable_utc=True,
+    broker_connection_retry_on_startup=True,
+    broker_transport_options={"visibility_timeout": 3600},
+)
 
-    # Simulated logic
-    result = {"status": "ok", "data": data}
-
+# ---------------------------------------------------------------------
+# Startup Banner
+# ---------------------------------------------------------------------
+try:
     log_event(
         service="celery",
-        event="task_complete",
+        event="startup",
         status="ok",
-        message=f"Task completed: {data}",
-        trace_id=trace_id,
+        message="Celery app initialized",
     )
-    return {"status": "ok", "trace_id": trace_id, "result": result}
+except Exception as e:
+    logging.error(f"Failed to log Celery startup: {e}")
 
-
-# --- Export for imports in other modules ---
-celery_app = celery
+# Export symbol
+__all__ = ["celery_app"]
